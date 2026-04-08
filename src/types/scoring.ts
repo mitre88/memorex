@@ -48,8 +48,6 @@ export function estimateTokens(text: string): number {
 }
 
 export function formatMemoryForContext(m: Memory, maxBody: number = 500): string {
-  const body = m.body.length > maxBody
-    ? m.body.slice(0, maxBody) + '...'
-    : m.body;
+  const body = m.body.length > maxBody ? m.body.slice(0, maxBody) + '...' : m.body;
   return `[${m.type.toUpperCase()}] ${m.title}\n${body}`;
 }

@@ -15,6 +15,40 @@ chmod +x install.sh
 
 Restart Claude Code after installing.
 
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Run tests
+npm test
+
+# Run tests with coverage
+npm run test:coverage
+
+# Build
+npm run build
+
+# Lint
+npm run lint
+
+# Format
+npm run format
+```
+
+## Project Structure
+
+```
+src/
+├── __tests__/          # Test suite (Vitest)
+├── db/                 # Database layer (SQLite + FTS5)
+├── hooks/              # Session lifecycle hooks
+├── tools/              # MCP tool implementations
+├── types/              # Shared TypeScript types
+└── utils/              # Utilities (config, logging, session, security)
+```
+
 ## How it works
 
 - **SQLite + FTS5** — fast full-text search, zero external APIs
@@ -25,30 +59,30 @@ Restart Claude Code after installing.
 
 ## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `memory_search` | Find relevant memories for current context |
-| `memory_save` | Save or update a memory (with dedup + session limits) |
-| `memory_prune` | Remove expired or low-relevance memories |
-| `memory_stats` | Storage overview and session budget |
+| Tool            | Description                                           |
+| --------------- | ----------------------------------------------------- |
+| `memory_search` | Find relevant memories for current context            |
+| `memory_save`   | Save or update a memory (with dedup + session limits) |
+| `memory_prune`  | Remove expired or low-relevance memories              |
+| `memory_stats`  | Storage overview and session budget                   |
 
 ## Session Hooks
 
-| Hook | When | What |
-|------|------|------|
-| `SessionStart` | Opening Claude Code | Resets session counter, prints 1-line status |
-| `Stop` | Closing Claude Code | Silently prunes expired/cold memories (0 token cost) |
+| Hook           | When                | What                                                 |
+| -------------- | ------------------- | ---------------------------------------------------- |
+| `SessionStart` | Opening Claude Code | Resets session counter, prints 1-line status         |
+| `Stop`         | Closing Claude Code | Silently prunes expired/cold memories (0 token cost) |
 
 ## Limits
 
-| Limit | Value |
-|-------|-------|
-| Max memories | 200 (evicts lowest-scoring on overflow) |
-| Saves per session | 5 |
-| Body size (save) | 1500 chars |
-| Body size (display) | 500 chars |
-| Search token budget | 2000 (configurable) |
-| Project memory TTL | 30 days default |
+| Limit               | Value                                   |
+| ------------------- | --------------------------------------- |
+| Max memories        | 200 (evicts lowest-scoring on overflow) |
+| Saves per session   | 5                                       |
+| Body size (save)    | 1500 chars                              |
+| Body size (display) | 500 chars                               |
+| Search token budget | 2000 (configurable)                     |
+| Project memory TTL  | 30 days default                         |
 
 ## Storage
 
