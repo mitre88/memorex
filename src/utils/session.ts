@@ -34,7 +34,10 @@ function releaseLock(lockDir: string): void {
 function readState(): SessionState {
   try {
     if (!existsSync(CONFIG.SESSION_FILE)) return fresh();
-    const s: SessionState = JSON.parse(readFileSync(CONFIG.SESSION_FILE, 'utf8'));
+    const content = readFileSync(CONFIG.SESSION_FILE, 'utf8');
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== 'object') return fresh();
+    const s = parsed as SessionState;
     const age = Math.floor(Date.now() / 1000) - s.started;
     if (age > SESSION_TTL) {
       const f = fresh();

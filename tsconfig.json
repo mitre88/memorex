@@ -8,8 +8,9 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "allowJs": true
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "*.config.ts", "*.config.mjs"],
   "exclude": ["node_modules", "dist"]
 }
