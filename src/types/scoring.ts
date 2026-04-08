@@ -1,3 +1,5 @@
+import { TIME, SCORING } from '../utils/config.js';
+
 export interface Memory {
   id: number;
   type: string;
@@ -14,23 +16,18 @@ export interface Memory {
 }
 
 const NOW = () => Math.floor(Date.now() / 1000);
-const DAY = 86400;
 
 /**
  * Score = importance × recency_decay × relevance_boost × type_weight
  * Higher = more relevant to surface now
  */
 export function scoreMemory(m: Memory, ftsRank: number = 0): number {
-  const ageDays = (NOW() - m.accessed_at) / DAY;
+  const ageDays = (NOW() - m.accessed_at) / TIME.DAY;
 
   // Recency decay: half-life varies by type
-  const halfLife: Record<string, number> = {
-    feedback: 90,
-    user: 180,
-    project: 14,
-    reference: 365,
-  };
-  const hl = halfLife[m.type] ?? 60;
+  const hl =
+    SCORING.HALF_LIFE_DAYS[m.type as keyof typeof SCORING.HALF_LIFE_DAYS] ??
+    SCORING.HALF_LIFE_DAYS.default;
   const recency = Math.pow(0.5, ageDays / hl);
 
   // FTS relevance (lower bm25 rank = better match in SQLite FTS5)
@@ -43,11 +40,19 @@ export function scoreMemory(m: Memory, ftsRank: number = 0): number {
 }
 
 export function estimateTokens(text: string): number {
-  // ~4 chars per token (rough estimate)
-  return Math.ceil(text.length / 4);
+  // ~3 chars per token for code/mixed content (more accurate than 4)
+  return Math.ceil(text.length / SCORING.CHARS_PER_TOKEN);
 }
 
 export function formatMemoryForContext(m: Memory, maxBody: number = 500): string {
-  const body = m.body.length > maxBody ? m.body.slice(0, maxBody) + '...' : m.body;
-  return `[${m.type.toUpperCase()}] ${m.title}\n${body}`;
+  // Truncate at sentence boundary if possible
+  let body = m.body;
+  if (body.length > maxBody) {
+    const truncated = body.slice(0, maxBody);
+    const lastSentence = truncated.match(/.*[.!?]\s*/);
+    body = lastSentence ? lastSentence[0].trim() : truncated + '...';
+  }
+  // Compact format: type as single letter prefix
+  const typePrefix = m.type[0].toUpperCase();
+  return `${typePrefix}:${m.title}|${body}`;
 }

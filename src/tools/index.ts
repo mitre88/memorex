@@ -1,7 +1,15 @@
 import Database from 'better-sqlite3';
 import { z } from 'zod';
 import { Memory, scoreMemory, estimateTokens, formatMemoryForContext } from '../types/scoring.js';
-import { CONFIG } from '../utils/config.js';
+import {
+  CONFIG,
+  LIMITS,
+  SCORING,
+  DEFAULT_TTL_DAYS,
+  SEARCH_DEFAULTS,
+  PRUNE_DEFAULTS,
+  TIME,
+} from '../utils/config.js';
 import { canSave, recordSave, sessionStats } from '../utils/session.js';
 import { logger } from '../utils/logger.js';
 import { isValidProjectPath, sanitizeFtsQuery, validateTags } from '../utils/security.js';
@@ -11,15 +19,18 @@ export const SearchInput = z.object({
   query: z.string().describe('Search query — keywords, topic, or question'),
   project: z.string().optional().describe('Filter to specific project path'),
   types: z.array(z.enum(['user', 'project', 'feedback', 'reference'])).optional(),
-  token_budget: z.number().default(2000).describe('Max tokens to return'),
-  min_score: z.number().default(0.05).describe('Minimum relevance score (0-1)'),
+  token_budget: z.number().default(SEARCH_DEFAULTS.TOKEN_BUDGET).describe('Max tokens to return'),
+  min_score: z
+    .number()
+    .default(SEARCH_DEFAULTS.MIN_SCORE)
+    .describe('Minimum relevance score (0-1)'),
 });
 
 export type SaveInputType = z.infer<typeof SaveInput>;
 export const SaveInput = z.object({
   type: z.enum(['user', 'project', 'feedback', 'reference']),
   title: z.string().describe('Short title (< 80 chars)'),
-  body: z.string().max(1500).describe('Memory content (max 1500 chars)'),
+  body: z.string().max(LIMITS.MAX_BODY_LENGTH).describe('Memory content (max 1500 chars)'),
   project: z.string().optional().describe('Project path this applies to'),
   tags: z.array(z.string()).default([]),
   importance: z.number().min(0).max(1).default(0.5).describe('0=low, 0.5=normal, 1=critical'),
@@ -32,7 +43,10 @@ export const SaveInput = z.object({
 export type PruneInputType = z.infer<typeof PruneInput>;
 export const PruneInput = z.object({
   dry_run: z.boolean().default(true).describe('If true, only report what would be deleted'),
-  max_age_days: z.number().default(90).describe('Delete memories older than this (if score < 0.1)'),
+  max_age_days: z
+    .number()
+    .default(PRUNE_DEFAULTS.MAX_AGE_DAYS)
+    .describe('Delete memories older than this (if score < 0.1)'),
 });
 
 export type StatsInputType = z.infer<typeof StatsInput>;
@@ -72,7 +86,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
         ${projectFilter}
         AND (m.expires_at IS NULL OR m.expires_at > ?)
       ORDER BY fts.rank
-      LIMIT 50
+      LIMIT 25
     `
       )
       .all(...params) as (Memory & { fts_rank: number })[];
@@ -100,7 +114,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
   const results: string[] = [];
   let tokensUsed = 0;
   // Only refresh accessed_at if last access was >1 hour ago (prevents decay-killing)
-  const ACCESS_COOLDOWN = 3600;
+  const ACCESS_COOLDOWN = LIMITS.ACCESS_COOLDOWN_SECONDS;
   const updateStmt = db.prepare(
     'UPDATE memories SET accessed_at = ?, access_count = access_count + 1 WHERE id = ? AND accessed_at < ?'
   );
@@ -115,7 +129,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
   }
 
   if (results.length === 0) return 'No relevant memories found.';
-  return `Found ${results.length} memories (~${tokensUsed} tokens):\n\n${results.join('\n\n---\n\n')}`;
+  return `${results.length}|${tokensUsed}tk:\n${results.join('\n|\n')}`;
 }
 
 export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInput>): string {
@@ -130,9 +144,9 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
   if (input.tags && !validateTags(input.tags)) {
     return 'Error: Invalid tags format.';
   }
-  // Default TTL for project type (30 days) to prevent zombie memories
-  const ttl = input.ttl_days ?? (input.type === 'project' ? 30 : undefined);
-  const expiresAt = ttl ? now + ttl * 86400 : null;
+  // Default TTL for project type to prevent zombie memories
+  const ttl = input.ttl_days ?? DEFAULT_TTL_DAYS[input.type];
+  const expiresAt = ttl ? now + ttl * TIME.DAY : null;
 
   // Guard 1: session limit
   if (!canSave()) {
@@ -176,7 +190,7 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     const bWords = new Set(nt.split(' ').filter((w) => w.length > 3));
     if (aWords.size === 0) return false;
     const overlap = [...aWords].filter((w) => bWords.has(w)).length;
-    return overlap / aWords.size >= 0.7;
+    return overlap / aWords.size >= SCORING.FUZZY_MATCH_THRESHOLD;
   });
 
   if (similar) {
@@ -229,24 +243,25 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
 
 export function pruneMemories(db: Database.Database, input: z.infer<typeof PruneInput>): string {
   const now = Math.floor(Date.now() / 1000);
-  const cutoff = now - input.max_age_days * 86400;
+  const cutoff = now - input.max_age_days * TIME.DAY;
 
+  // Select only fields needed for scoring - avoid fetching full body
   const candidates = db
     .prepare(
       `
-    SELECT * FROM memories WHERE accessed_at < ? OR (expires_at IS NOT NULL AND expires_at < ?)
+    SELECT id, type, importance, access_count, created_at, accessed_at, expires_at, title
+    FROM memories WHERE accessed_at < ? OR (expires_at IS NOT NULL AND expires_at < ?)
   `
     )
     .all(cutoff, now) as Memory[];
 
   // Type-aware prune thresholds (project decays faster → higher threshold)
-  const pruneThreshold: Record<string, number> = {
-    project: 0.15,
-    feedback: 0.1,
-    user: 0.08,
-    reference: 0.05,
-  };
-  const toDelete = candidates.filter((m) => scoreMemory(m) < (pruneThreshold[m.type] ?? 0.1));
+  const toDelete = candidates.filter(
+    (m) =>
+      scoreMemory(m) <
+      (SCORING.PRUNE_THRESHOLD[m.type as keyof typeof SCORING.PRUNE_THRESHOLD] ??
+        SCORING.DEFAULT_PRUNE_THRESHOLD)
+  );
 
   if (input.dry_run) {
     if (toDelete.length === 0) return 'Nothing to prune.';
@@ -280,9 +295,9 @@ export function getStats(db: Database.Database, input: z.infer<typeof StatsInput
     .prepare(`SELECT MIN(created_at) as ts FROM memories ${projectFilter}`)
     .get(...params) as { ts: number | null };
 
-  const typeLines = counts.map((r) => `  ${r.type}: ${r.count}`).join('\n');
+  const typeSummary = counts.map((r) => `${r.type[0]}:${r.count}`).join(' ');
   const oldestStr = oldest.ts ? new Date(oldest.ts * 1000).toISOString().split('T')[0] : 'N/A';
   const sess = sessionStats();
 
-  return `Memorex stats:\n  Total: ${total.n}\n${typeLines}\n  Oldest: ${oldestStr}\n  Session: ${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION} saves used`;
+  return `M:${total.n} ${typeSummary} ${oldestStr} S:${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION}`;
 }

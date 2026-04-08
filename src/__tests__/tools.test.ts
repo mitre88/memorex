@@ -112,8 +112,8 @@ describe('tools', () => {
   describe('getStats', () => {
     it('returns stats for empty database', () => {
       const result = getStats(db, {});
-      expect(result).toContain('Total: 0');
-      expect(result).toContain('Session:');
+      expect(result).toContain('M:0');
+      expect(result).toContain('S:');
     });
   });
 });

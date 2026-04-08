@@ -1,13 +1,13 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmdirSync } from 'fs';
 import { dirname } from 'path';
-import { CONFIG } from './config.js';
+import { CONFIG, SESSION } from './config.js';
 
 interface SessionState {
   saves: number;
   started: number; // unix seconds
 }
 
-const SESSION_TTL = 4 * 3600; // 4 hours
+const SESSION_TTL = SESSION.TTL_SECONDS;
 const LOCK_DIR_SUFFIX = '.lock';
 
 /**

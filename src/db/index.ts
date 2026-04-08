@@ -1,23 +1,48 @@
 import Database from 'better-sqlite3';
-import { join } from 'path';
-import { homedir } from 'os';
 import { mkdirSync, chmodSync } from 'fs';
-
-const DB_DIR = join(homedir(), '.memorex');
-const DB_PATH = join(DB_DIR, 'memories.db');
+import { PATHS } from '../utils/config.js';
+import { logger } from '../utils/logger.js';
 
 export function getDb(): Database.Database {
-  mkdirSync(DB_DIR, { recursive: true, mode: 0o700 });
-  const db = new Database(DB_PATH);
+  try {
+    mkdirSync(PATHS.DB_DIR, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    logger.error('Failed to create database directory', error as Error);
+    throw new Error(
+      `Cannot create database directory at ${PATHS.DB_DIR}: ${(error as Error).message}`,
+      { cause: error }
+    );
+  }
+
+  let db: Database.Database;
+  try {
+    db = new Database(PATHS.DB_FILE);
+  } catch (error) {
+    logger.error('Failed to open database', error as Error);
+    throw new Error(`Cannot open database at ${PATHS.DB_FILE}: ${(error as Error).message}`, {
+      cause: error,
+    });
+  }
+
   // Set restrictive permissions on database file
   try {
-    chmodSync(DB_PATH, 0o600);
+    chmodSync(PATHS.DB_FILE, 0o600);
   } catch {
     // Ignore if permission denied
   }
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  initSchema(db);
+
+  try {
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+    initSchema(db);
+  } catch (error) {
+    logger.error('Failed to initialize database schema', error as Error);
+    db.close();
+    throw new Error(`Cannot initialize database schema: ${(error as Error).message}`, {
+      cause: error,
+    });
+  }
+
   return db;
 }
 

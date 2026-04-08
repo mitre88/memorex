@@ -55,9 +55,9 @@ describe('scoreMemory', () => {
 });
 
 describe('estimateTokens', () => {
-  it('estimates ~4 chars per token', () => {
-    expect(estimateTokens('a'.repeat(40))).toBe(10);
-    expect(estimateTokens('a'.repeat(100))).toBe(25);
+  it('estimates ~3 chars per token', () => {
+    expect(estimateTokens('a'.repeat(30))).toBe(10);
+    expect(estimateTokens('a'.repeat(99))).toBe(33);
   });
 
   it('rounds up', () => {
@@ -68,7 +68,7 @@ describe('estimateTokens', () => {
 describe('formatMemoryForContext', () => {
   it('formats memory correctly', () => {
     const formatted = formatMemoryForContext(baseMemory);
-    expect(formatted).toContain('[USER]');
+    expect(formatted).toContain('U:');
     expect(formatted).toContain('Test Memory');
     expect(formatted).toContain('This is a test memory body');
   });

@@ -34,7 +34,7 @@ s.hooks.SessionStart = s.hooks.SessionStart || [];
 if (!s.hooks.SessionStart.some(g => g.hooks?.some(h => h.command?.includes('memorex')))) {
   s.hooks.SessionStart.push({
     matcher: '',
-    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/session-start.js 2>/dev/null || true' }]
+    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/start.js 2>/dev/null || true' }]
   });
 }
 
@@ -43,7 +43,7 @@ s.hooks.Stop = s.hooks.Stop || [];
 if (!s.hooks.Stop.some(g => g.hooks?.some(h => h.command?.includes('memorex')))) {
   s.hooks.Stop.push({
     matcher: '',
-    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/session-end.js 2>/dev/null || true' }]
+    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/end.js 2>/dev/null || true' }]
   });
 }
 

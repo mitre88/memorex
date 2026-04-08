@@ -8,8 +8,10 @@ const now = Math.floor(Date.now() / 1000);
 // Delete expired
 db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
 
+import { TIME, PRUNE_DEFAULTS } from '../utils/config.js';
+
 // Delete memories not accessed in 90+ days with score < 0.05
-const cutoff = now - 90 * 86400;
+const cutoff = now - PRUNE_DEFAULTS.MAX_AGE_DAYS * TIME.DAY;
 const old = db.prepare('SELECT * FROM memories WHERE accessed_at < ?').all(cutoff) as Memory[];
 const toDelete = old.filter((m) => scoreMemory(m) < 0.05).map((m) => m.id);
 if (toDelete.length > 0) {

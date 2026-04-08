@@ -1,5 +1,6 @@
 import { normalize, resolve } from 'path';
 import { homedir } from 'os';
+import { LIMITS } from './config.js';
 
 /**
  * Sanitizes user input for SQLite FTS5 queries.
@@ -19,9 +20,8 @@ export function sanitizeFtsQuery(query: string): string {
     .trim();
 
   // Limit length to prevent DoS via complex queries
-  const MAX_QUERY_LENGTH = 200;
-  if (sanitized.length > MAX_QUERY_LENGTH) {
-    sanitized = sanitized.slice(0, MAX_QUERY_LENGTH);
+  if (sanitized.length > LIMITS.MAX_QUERY_LENGTH) {
+    sanitized = sanitized.slice(0, LIMITS.MAX_QUERY_LENGTH);
   }
 
   return sanitized || '*';
@@ -68,7 +68,7 @@ export function isValidProjectPath(project: string): boolean {
   }
 
   // Length limit
-  if (project.length > 500) {
+  if (project.length > LIMITS.MAX_PROJECT_PATH_LENGTH) {
     return false;
   }
 
@@ -84,7 +84,7 @@ export function validateTags(tags: string[]): boolean {
   }
 
   // Limit number of tags
-  if (tags.length > 20) {
+  if (tags.length > LIMITS.MAX_TAGS) {
     return false;
   }
 
@@ -100,7 +100,7 @@ export function validateTags(tags: string[]): boolean {
     }
 
     // Length limit per tag
-    if (tag.length > 50) {
+    if (tag.length > LIMITS.MAX_TAG_LENGTH) {
       return false;
     }
   }

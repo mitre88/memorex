@@ -22,10 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved type safety by removing all `any` casts
 - Enhanced error handling with contextual logging
 - Updated `.gitignore` with comprehensive exclusions
+- Centralized all magic numbers in config.ts (TIME, LIMITS, SCORING, DEFAULT_TTL_DAYS, etc.)
+- Refactored formatMemoryForContext to use compact output format
+- Refactored getStats to use compact output format
+- Enhanced Logger with close() method and process signal handlers
+- Improved database error handling with descriptive messages
 
 ### Security
 
 - Added input validation for project paths
+- Improved error handling with cause preservation
+
+### Fixed
+
+- Corrected hook file names in install.sh (start.js/end.js)
+- Fixed TypeScript configuration for ESLint
 
 ## [0.1.0] - 2024-04-08
 
