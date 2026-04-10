@@ -1,4 +1,12 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmdirSync } from 'fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  chmodSync,
+  rmdirSync,
+  statSync,
+} from 'fs';
 import { dirname } from 'path';
 import { CONFIG, SESSION } from './config.js';
 
@@ -9,16 +17,29 @@ interface SessionState {
 
 const SESSION_TTL = SESSION.TTL_SECONDS;
 const LOCK_DIR_SUFFIX = '.lock';
+const STALE_LOCK_SECONDS = 60;
 
 /**
  * Simple atomic file locking using mkdir (atomic on most filesystems).
- * Returns true if lock acquired, false otherwise.
+ * Detects and removes stale locks older than 60 seconds.
  */
 function acquireLock(lockDir: string): boolean {
   try {
     mkdirSync(lockDir, { recursive: false });
     return true;
   } catch {
+    // Lock exists — check if stale
+    try {
+      const stat = statSync(lockDir);
+      const ageSeconds = (Date.now() - stat.mtimeMs) / 1000;
+      if (ageSeconds > STALE_LOCK_SECONDS) {
+        rmdirSync(lockDir);
+        mkdirSync(lockDir, { recursive: false });
+        return true;
+      }
+    } catch {
+      // stat or rmdir failed — another process may have resolved it
+    }
     return false;
   }
 }

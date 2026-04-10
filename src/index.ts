@@ -7,14 +7,26 @@ import {
   SaveInput,
   PruneInput,
   StatsInput,
+  UpdateInput,
+  DeleteInput,
+  ContextInput,
+  ExportInput,
   type SearchInputType,
   type SaveInputType,
   type PruneInputType,
   type StatsInputType,
+  type UpdateInputType,
+  type DeleteInputType,
+  type ContextInputType,
+  type ExportInputType,
   searchMemories,
   saveMemory,
   pruneMemories,
   getStats,
+  updateMemory,
+  deleteMemory,
+  getContext,
+  exportMemories,
 } from './tools/index.js';
 
 const server = new McpServer({
@@ -26,7 +38,7 @@ const db = getDb();
 
 server.tool(
   'memory_search',
-  'Search memories relevant to current context. Returns scored memories within token budget.',
+  'Find relevant memories within token budget',
   SearchInput.shape,
   // eslint-disable-next-line @typescript-eslint/require-await
   async (input: SearchInputType) => ({
@@ -36,7 +48,7 @@ server.tool(
 
 server.tool(
   'memory_save',
-  'Save a new memory or update existing one with same title+type.',
+  'Save or update a memory (deduped)',
   SaveInput.shape,
   // eslint-disable-next-line @typescript-eslint/require-await
   async (input: SaveInputType) => ({
@@ -46,7 +58,7 @@ server.tool(
 
 server.tool(
   'memory_prune',
-  'Remove low-relevance, expired, or old memories to keep storage clean.',
+  'Remove expired/low-relevance memories',
   PruneInput.shape,
   // eslint-disable-next-line @typescript-eslint/require-await
   async (input: PruneInputType) => ({
@@ -56,11 +68,51 @@ server.tool(
 
 server.tool(
   'memory_stats',
-  'Show memory count by type and storage stats.',
+  'Memory count and session budget',
   StatsInput.shape,
   // eslint-disable-next-line @typescript-eslint/require-await
   async (input: StatsInputType) => ({
     content: [{ type: 'text', text: getStats(db, input) }],
+  })
+);
+
+server.tool(
+  'memory_update',
+  'Update a memory by ID',
+  UpdateInput.shape,
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async (input: UpdateInputType) => ({
+    content: [{ type: 'text', text: updateMemory(db, input) }],
+  })
+);
+
+server.tool(
+  'memory_delete',
+  'Delete a memory by ID',
+  DeleteInput.shape,
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async (input: DeleteInputType) => ({
+    content: [{ type: 'text', text: deleteMemory(db, input) }],
+  })
+);
+
+server.tool(
+  'memory_context',
+  'Auto-context: top memories for current project',
+  ContextInput.shape,
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async (input: ContextInputType) => ({
+    content: [{ type: 'text', text: getContext(db, input) }],
+  })
+);
+
+server.tool(
+  'memory_export',
+  'Export memories as JSON or markdown',
+  ExportInput.shape,
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async (input: ExportInputType) => ({
+    content: [{ type: 'text', text: exportMemories(db, input) }],
   })
 );
 

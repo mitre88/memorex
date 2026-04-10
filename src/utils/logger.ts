@@ -1,9 +1,11 @@
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
+import { join } from 'path';
 import { PATHS } from './config.js';
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const LOG_FILE = `${PATHS.LOG_DIR}/memorex-${new Date().toISOString().split('T')[0]}.log`;
+const MAX_LOG_FILES = 7;
 
 class Logger {
   private stream: ReturnType<typeof createWriteStream> | null = null;
@@ -34,8 +36,23 @@ class Logger {
         mkdirSync(PATHS.LOG_DIR, { recursive: true });
       }
       this.stream = createWriteStream(LOG_FILE, { flags: 'a' });
+      this.rotateOldLogs();
     }
     return this.stream;
+  }
+
+  private rotateOldLogs(): void {
+    try {
+      const files = readdirSync(PATHS.LOG_DIR)
+        .filter((f) => f.startsWith('memorex-') && f.endsWith('.log'))
+        .sort()
+        .reverse();
+      for (const file of files.slice(MAX_LOG_FILES)) {
+        unlinkSync(join(PATHS.LOG_DIR, file));
+      }
+    } catch {
+      // Ignore rotation errors
+    }
   }
 
   private shouldLog(level: LogLevel): boolean {

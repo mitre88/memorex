@@ -55,6 +55,7 @@ describe('tools', () => {
         body: 'Test content',
         importance: 0.7,
         tags: [],
+        pinned: false,
       });
       expect(result).toContain('Saved memory');
       expect(result).toContain('Test Memory');
@@ -67,6 +68,7 @@ describe('tools', () => {
         body: 'First',
         importance: 0.5,
         tags: [],
+        pinned: false,
       });
       const result = saveMemory(db, {
         type: 'user',
@@ -74,6 +76,7 @@ describe('tools', () => {
         body: 'Second',
         importance: 0.6,
         tags: [],
+        pinned: false,
       });
       expect(result).toContain('Updated');
     });

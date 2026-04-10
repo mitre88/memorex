@@ -15,6 +15,7 @@ const baseMemory: Memory = {
   tags: '[]',
   importance: 0.5,
   access_count: 0,
+  pinned: 0,
   created_at: Math.floor(Date.now() / 1000),
   accessed_at: Math.floor(Date.now() / 1000),
   expires_at: null,

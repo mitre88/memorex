@@ -9,6 +9,7 @@ export interface Memory {
   tags: string;
   importance: number;
   access_count: number;
+  pinned: number;
   created_at: number;
   accessed_at: number;
   expires_at: number | null;
@@ -22,6 +23,7 @@ const NOW = () => Math.floor(Date.now() / 1000);
  * Higher = more relevant to surface now
  */
 export function scoreMemory(m: Memory, ftsRank: number = 0): number {
+  if (m.pinned) return 999; // Pinned memories always survive
   const ageDays = (NOW() - m.accessed_at) / TIME.DAY;
 
   // Recency decay: half-life varies by type
@@ -52,7 +54,6 @@ export function formatMemoryForContext(m: Memory, maxBody: number = 500): string
     const lastSentence = truncated.match(/.*[.!?]\s*/);
     body = lastSentence ? lastSentence[0].trim() : truncated + '...';
   }
-  // Compact format: type as single letter prefix
   const typePrefix = m.type[0].toUpperCase();
-  return `${typePrefix}:${m.title}|${body}`;
+  return `#${m.id} ${typePrefix}:${m.title}|${body}`;
 }

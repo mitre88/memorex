@@ -35,6 +35,7 @@ export function getDb(): Database.Database {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     initSchema(db);
+    migrateSchema(db);
   } catch (error) {
     logger.error('Failed to initialize database schema', error as Error);
     db.close();
@@ -44,6 +45,14 @@ export function getDb(): Database.Database {
   }
 
   return db;
+}
+
+function migrateSchema(db: Database.Database): void {
+  // v0.2.0: add pinned column
+  const cols = db.pragma('table_info(memories)') as { name: string }[];
+  if (!cols.some((c) => c.name === 'pinned')) {
+    db.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER DEFAULT 0');
+  }
 }
 
 function initSchema(db: Database.Database): void {
@@ -57,6 +66,7 @@ function initSchema(db: Database.Database): void {
       tags        TEXT DEFAULT '[]',
       importance  REAL DEFAULT 0.5,
       access_count INTEGER DEFAULT 0,
+      pinned      INTEGER DEFAULT 0,
       created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
       accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
       expires_at  INTEGER

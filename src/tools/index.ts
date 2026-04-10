@@ -16,43 +16,174 @@ import { isValidProjectPath, sanitizeFtsQuery, validateTags } from '../utils/sec
 
 export type SearchInputType = z.infer<typeof SearchInput>;
 export const SearchInput = z.object({
-  query: z.string().describe('Search query — keywords, topic, or question'),
-  project: z.string().optional().describe('Filter to specific project path'),
+  query: z.string().describe('Keywords or question'),
+  project: z.string().optional().describe('Project path filter'),
   types: z.array(z.enum(['user', 'project', 'feedback', 'reference'])).optional(),
-  token_budget: z.number().default(SEARCH_DEFAULTS.TOKEN_BUDGET).describe('Max tokens to return'),
-  min_score: z
-    .number()
-    .default(SEARCH_DEFAULTS.MIN_SCORE)
-    .describe('Minimum relevance score (0-1)'),
+  token_budget: z.number().default(SEARCH_DEFAULTS.TOKEN_BUDGET).describe('Max tokens'),
+  min_score: z.number().default(SEARCH_DEFAULTS.MIN_SCORE).describe('Min score 0-1'),
 });
 
 export type SaveInputType = z.infer<typeof SaveInput>;
 export const SaveInput = z.object({
   type: z.enum(['user', 'project', 'feedback', 'reference']),
-  title: z.string().describe('Short title (< 80 chars)'),
-  body: z.string().max(LIMITS.MAX_BODY_LENGTH).describe('Memory content (max 1500 chars)'),
-  project: z.string().optional().describe('Project path this applies to'),
+  title: z.string().describe('Title (<80 chars)'),
+  body: z.string().max(LIMITS.MAX_BODY_LENGTH).describe('Content'),
+  project: z.string().optional().describe('Project path'),
   tags: z.array(z.string()).default([]),
-  importance: z.number().min(0).max(1).default(0.5).describe('0=low, 0.5=normal, 1=critical'),
-  ttl_days: z
-    .number()
-    .optional()
-    .describe('Auto-expire after N days. Default: 30 for project type'),
+  importance: z.number().min(0).max(1).default(0.5).describe('0-1 importance'),
+  ttl_days: z.number().optional().describe('Expire after N days'),
+  pinned: z.boolean().default(false).describe('Never decay or prune'),
 });
 
 export type PruneInputType = z.infer<typeof PruneInput>;
 export const PruneInput = z.object({
-  dry_run: z.boolean().default(true).describe('If true, only report what would be deleted'),
-  max_age_days: z
-    .number()
-    .default(PRUNE_DEFAULTS.MAX_AGE_DAYS)
-    .describe('Delete memories older than this (if score < 0.1)'),
+  dry_run: z.boolean().default(true).describe('Preview only'),
+  max_age_days: z.number().default(PRUNE_DEFAULTS.MAX_AGE_DAYS).describe('Age threshold'),
 });
 
 export type StatsInputType = z.infer<typeof StatsInput>;
 export const StatsInput = z.object({
-  project: z.string().optional(),
+  project: z.string().optional().describe('Project filter'),
 });
+
+export type UpdateInputType = z.infer<typeof UpdateInput>;
+export const UpdateInput = z.object({
+  id: z.number().describe('Memory ID'),
+  body: z.string().max(LIMITS.MAX_BODY_LENGTH).optional().describe('New content'),
+  importance: z.number().min(0).max(1).optional().describe('New importance'),
+  pinned: z.boolean().optional().describe('Pin/unpin'),
+  tags: z.array(z.string()).optional().describe('New tags'),
+});
+
+export type DeleteInputType = z.infer<typeof DeleteInput>;
+export const DeleteInput = z.object({
+  id: z.number().describe('Memory ID to delete'),
+});
+
+export type ContextInputType = z.infer<typeof ContextInput>;
+export const ContextInput = z.object({
+  project: z.string().optional().describe('Project path (defaults to cwd)'),
+  token_budget: z.number().default(1500).describe('Max tokens'),
+});
+
+export function updateMemory(db: Database.Database, input: UpdateInputType): string {
+  const existing = db.prepare('SELECT id FROM memories WHERE id = ?').get(input.id) as
+    | { id: number }
+    | undefined;
+  if (!existing) return `Memory #${input.id} not found.`;
+
+  const now = Math.floor(Date.now() / 1000);
+  const sets: string[] = ['accessed_at = ?'];
+  const params: (string | number)[] = [now];
+
+  if (input.body !== undefined) {
+    sets.push('body = ?');
+    params.push(input.body);
+  }
+  if (input.importance !== undefined) {
+    sets.push('importance = ?');
+    params.push(input.importance);
+  }
+  if (input.pinned !== undefined) {
+    sets.push('pinned = ?');
+    params.push(input.pinned ? 1 : 0);
+  }
+  if (input.tags !== undefined) {
+    if (!validateTags(input.tags)) return 'Error: Invalid tags.';
+    sets.push('tags = ?');
+    params.push(JSON.stringify(input.tags));
+  }
+
+  params.push(input.id);
+  db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+  return `Updated #${input.id}`;
+}
+
+export function deleteMemory(db: Database.Database, input: DeleteInputType): string {
+  const existing = db.prepare('SELECT id, title FROM memories WHERE id = ?').get(input.id) as
+    | { id: number; title: string }
+    | undefined;
+  if (!existing) return `Memory #${input.id} not found.`;
+  db.prepare('DELETE FROM memories WHERE id = ?').run(input.id);
+  return `Deleted #${input.id}: "${existing.title}"`;
+}
+
+export function getContext(db: Database.Database, input: ContextInputType): string {
+  const now = Math.floor(Date.now() / 1000);
+  const project = input.project ?? process.cwd();
+
+  // Get pinned memories first (always included)
+  const pinned = db
+    .prepare('SELECT * FROM memories WHERE pinned = 1 AND (expires_at IS NULL OR expires_at > ?)')
+    .all(now) as Memory[];
+
+  // Get project-relevant + recent high-importance memories
+  const projectMems = db
+    .prepare(
+      `SELECT * FROM memories WHERE pinned = 0
+       AND (project IS NULL OR project = ?)
+       AND (expires_at IS NULL OR expires_at > ?)
+       ORDER BY importance * (1.0 / (1 + (? - accessed_at) / 86400.0)) DESC
+       LIMIT 20`
+    )
+    .all(project, now, now) as Memory[];
+
+  const all = [...pinned, ...projectMems];
+  const scored = all
+    .map((m) => ({ mem: m, score: scoreMemory(m) }))
+    .sort((a, b) => b.score - a.score);
+
+  // Dedup by id
+  const seen = new Set<number>();
+  const results: string[] = [];
+  let tokensUsed = 0;
+
+  for (const { mem } of scored) {
+    if (seen.has(mem.id)) continue;
+    seen.add(mem.id);
+    const formatted = formatMemoryForContext(mem, CONFIG.MAX_DISPLAY_BODY);
+    const tokens = estimateTokens(formatted);
+    if (tokensUsed + tokens > input.token_budget) break;
+    results.push(formatted);
+    tokensUsed += tokens;
+  }
+
+  if (results.length === 0) return 'No context memories.';
+  return `${results.length}|${tokensUsed}tk:\n${results.join('\n|\n')}`;
+}
+
+export type ExportInputType = z.infer<typeof ExportInput>;
+export const ExportInput = z.object({
+  format: z.enum(['json', 'markdown']).default('json').describe('Export format'),
+  types: z.array(z.enum(['user', 'project', 'feedback', 'reference'])).optional(),
+});
+
+export function exportMemories(db: Database.Database, input: ExportInputType): string {
+  const typeFilter = input.types?.length
+    ? `WHERE type IN (${input.types.map(() => '?').join(',')})`
+    : '';
+  const params = input.types ?? [];
+  const rows = db.prepare(`SELECT * FROM memories ${typeFilter} ORDER BY type, created_at DESC`).all(...params) as Memory[];
+
+  if (rows.length === 0) return 'No memories to export.';
+
+  if (input.format === 'json') {
+    return JSON.stringify(rows, null, 2);
+  }
+
+  // Markdown format
+  const grouped: Record<string, Memory[]> = {};
+  for (const m of rows) {
+    (grouped[m.type] ??= []).push(m);
+  }
+  const sections = Object.entries(grouped).map(([type, mems]) => {
+    const items = mems
+      .map((m) => `- **#${m.id} ${m.title}**${m.pinned ? ' 📌' : ''} (imp:${m.importance})\n  ${m.body.slice(0, 200)}`)
+      .join('\n');
+    return `## ${type}\n${items}`;
+  });
+  return sections.join('\n\n');
+}
 
 export function searchMemories(db: Database.Database, input: z.infer<typeof SearchInput>): string {
   const now = Math.floor(Date.now() / 1000);
@@ -221,8 +352,8 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
   const result = db
     .prepare(
       `
-    INSERT INTO memories (type, title, body, project, tags, importance, created_at, accessed_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO memories (type, title, body, project, tags, importance, pinned, created_at, accessed_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `
     )
     .run(
@@ -232,6 +363,7 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
       input.project ?? null,
       JSON.stringify(input.tags),
       input.importance,
+      input.pinned ? 1 : 0,
       now,
       now,
       expiresAt
