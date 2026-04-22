@@ -53,6 +53,24 @@ function migrateSchema(db: Database.Database): void {
   if (!cols.some((c) => c.name === 'pinned')) {
     db.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER DEFAULT 0');
   }
+
+  // v0.3.0: knowledge graph — memory_links. Created lazily here as well as in
+  // initSchema so existing v0.1/v0.2 databases pick it up on upgrade.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_links (
+      source_id   INTEGER NOT NULL,
+      target_id   INTEGER NOT NULL,
+      strength    REAL NOT NULL DEFAULT 0.5,
+      kind        TEXT NOT NULL DEFAULT 'related'
+                    CHECK(kind IN ('related','supersedes','references')),
+      created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+      PRIMARY KEY (source_id, target_id, kind),
+      FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
+      FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_links_source ON memory_links(source_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_id);
+  `);
 }
 
 function initSchema(db: Database.Database): void {

@@ -1,8 +1,8 @@
 # memorex
 
-Persistent memory and token savings for Claude Code.
+Passive persistent memory for Claude Code.
 
-An MCP server that gives Claude Code long-term memory across sessions — stored in SQLite with full-text search, scored by relevance decay, and bounded by hard token budgets.
+An MCP server + hook set that gives Claude Code long-term memory across sessions — stored in SQLite with full-text search, scored by BM25-weighted relevance decay, bounded by hard token budgets, and **auto-injected on every prompt** without Claude needing to call a tool.
 
 ## Install
 
@@ -51,38 +51,51 @@ src/
 
 ## How it works
 
-- **SQLite + FTS5** — fast full-text search, zero external APIs
+- **SQLite + FTS5 BM25** — fast full-text search, title weighted 10× over body, zero external APIs
 - **Decay scoring** — memories fade by type (project: 14d, feedback: 90d, user: 180d, reference: 365d)
 - **Token budgets** — search results capped to a configurable token limit, most relevant first
-- **Anti-bloat guards** — hard cap of 200 memories, 5 saves per session, fuzzy dedup, auto-prune on session end
+- **Passive auto-inject** — a `UserPromptSubmit` hook prepends top-3 relevant memories to every prompt without Claude calling a tool
+- **Compaction survival** — a `PreCompact` hook snapshots recent prompts + files touched into a 7-day project memory so long sessions don't go amnesic
+- **Knowledge graph** — every save auto-links to related memories; `memory_related` traverses neighbors
+- **Git-root aware** — project memories bind to `git rev-parse --show-toplevel`, not the current working dir, so sub-directory work doesn't fragment memory
+- **Anti-bloat guards** — hard cap of 200 memories, 5 saves per session, containment-based fuzzy dedup, auto-prune on session end
 - **4 memory types**: `user`, `project`, `feedback`, `reference`
 
 ## MCP Tools
 
-| Tool            | Description                                           |
-| --------------- | ----------------------------------------------------- |
-| `memory_search` | Find relevant memories for current context            |
-| `memory_save`   | Save or update a memory (with dedup + session limits) |
-| `memory_prune`  | Remove expired or low-relevance memories              |
-| `memory_stats`  | Storage overview and session budget                   |
+| Tool             | Description                                             |
+| ---------------- | ------------------------------------------------------- |
+| `memory_search`  | Find relevant memories for current context              |
+| `memory_save`    | Save or update a memory (with dedup + session limits)   |
+| `memory_prune`   | Remove expired or low-relevance memories                |
+| `memory_stats`   | Storage overview and session budget (compact or JSON)   |
+| `memory_update`  | Update a memory by ID                                   |
+| `memory_delete`  | Delete a memory by ID                                   |
+| `memory_context` | Auto-context: top memories for current git-root project |
+| `memory_export`  | Export memories as JSON or markdown                     |
+| `memory_related` | List knowledge-graph neighbors of a memory              |
 
 ## Session Hooks
 
-| Hook           | When                | What                                                 |
-| -------------- | ------------------- | ---------------------------------------------------- |
-| `SessionStart` | Opening Claude Code | Resets session counter, prints 1-line status         |
-| `Stop`         | Closing Claude Code | Silently prunes expired/cold memories (0 token cost) |
+| Hook               | When                | What                                                                    |
+| ------------------ | ------------------- | ----------------------------------------------------------------------- |
+| `SessionStart`     | Opening Claude Code | Resets session counter, prints 1-line status                            |
+| `UserPromptSubmit` | Every user prompt   | Auto-injects top-3 relevant memories (budget 500 tokens, zero if empty) |
+| `PreCompact`       | Before compaction   | Snapshots recent prompts + files into a 7-day memory                    |
+| `Stop`             | Closing Claude Code | Silently prunes expired/cold memories (0 token cost)                    |
 
 ## Limits
 
-| Limit               | Value                                   |
-| ------------------- | --------------------------------------- |
-| Max memories        | 200 (evicts lowest-scoring on overflow) |
-| Saves per session   | 5                                       |
-| Body size (save)    | 1500 chars                              |
-| Body size (display) | 500 chars                               |
-| Search token budget | 2000 (configurable)                     |
-| Project memory TTL  | 30 days default                         |
+| Limit                  | Value                                    |
+| ---------------------- | ---------------------------------------- |
+| Max memories           | 200 (evicts lowest-scoring on overflow)  |
+| Saves per session      | 5                                        |
+| Body size (save)       | 4000 chars                               |
+| Body size (display)    | 500 chars                                |
+| Search token budget    | 2000 (configurable)                      |
+| Auto-inject budget     | 500 tokens (via `MEMOREX_INJECT_BUDGET`) |
+| Project memory TTL     | 30 days default                          |
+| Pre-compact memory TTL | 7 days                                   |
 
 ## Storage
 

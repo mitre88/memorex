@@ -1,7 +1,7 @@
 {
   "name": "memorex",
-  "version": "0.1.0",
-  "description": "Intelligent memory management plugin for Claude Code",
+  "version": "0.3.0",
+  "description": "Passive memory layer for Claude Code — auto-inject, pre-compact snapshot, knowledge graph, SQLite FTS5",
   "type": "module",
   "bin": {
     "memorex": "./dist/index.js"

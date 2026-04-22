@@ -19,8 +19,13 @@ export interface Memory {
 const NOW = () => Math.floor(Date.now() / 1000);
 
 /**
- * Score = importance × recency_decay × relevance_boost × type_weight
+ * Score = importance × recency_decay × (1 + relevance + popularity)
  * Higher = more relevant to surface now
+ *
+ * FTS rank handling: SQLite BM25 returns NEGATIVE values (more negative = better match).
+ * A match of -10 is strong; -0.5 is weak; 0/positive means no FTS context (fallback path).
+ * Previous implementation gated on `ftsRank > 0` which was never true, so relevance
+ * was pinned to 0.1 for every row. Now we normalize the magnitude into [0, 1].
  */
 export function scoreMemory(m: Memory, ftsRank: number = 0): number {
   if (m.pinned) return 999; // Pinned memories always survive
@@ -32,8 +37,9 @@ export function scoreMemory(m: Memory, ftsRank: number = 0): number {
     SCORING.HALF_LIFE_DAYS.default;
   const recency = Math.pow(0.5, ageDays / hl);
 
-  // FTS relevance (lower bm25 rank = better match in SQLite FTS5)
-  const relevance = ftsRank > 0 ? 1 / (1 + Math.abs(ftsRank)) : 0.1;
+  // FTS relevance: BM25 returns negatives; magnitude/norm gives [0, 1].
+  // Default norm 5 means a rank of -5 maps to ~1.0 (great), -1 to 0.2, -0.1 to 0.02.
+  const relevance = ftsRank < 0 ? Math.min(1, Math.abs(ftsRank) / SCORING.FTS_RANK_NORM) : 0.1;
 
   // Access popularity boost
   const popularity = Math.log1p(m.access_count) / 10;

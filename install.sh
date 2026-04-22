@@ -47,11 +47,29 @@ if (!s.hooks.Stop.some(g => g.hooks?.some(h => h.command?.includes('memorex'))))
   });
 }
 
+// UserPromptSubmit: auto-inject top relevant memories (zero cost when empty)
+s.hooks.UserPromptSubmit = s.hooks.UserPromptSubmit || [];
+if (!s.hooks.UserPromptSubmit.some(g => g.hooks?.some(h => h.command?.includes('memorex')))) {
+  s.hooks.UserPromptSubmit.push({
+    matcher: '',
+    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/prompt.js 2>/dev/null || true' }]
+  });
+}
+
+// PreCompact: snapshot the session so context survives compaction
+s.hooks.PreCompact = s.hooks.PreCompact || [];
+if (!s.hooks.PreCompact.some(g => g.hooks?.some(h => h.command?.includes('memorex')))) {
+  s.hooks.PreCompact.push({
+    matcher: '',
+    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/precompact.js 2>/dev/null || true' }]
+  });
+}
+
 fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
-console.log('Configured: MCP server + SessionStart/Stop hooks');
+console.log('Configured: MCP server + SessionStart/Stop/UserPromptSubmit/PreCompact hooks');
 "
 
 echo ""
 echo "Done! Restart Claude Code to activate memorex."
 echo ""
-echo "Limits: 200 memories max | 5 saves/session | 1500 char body cap"
+echo "Limits: 200 memories max | 5 saves/session | 4000 char body cap"

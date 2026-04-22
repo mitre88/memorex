@@ -12,6 +12,7 @@ import {
 } from '../utils/config.js';
 import { canSave, recordSave, sessionStats } from '../utils/session.js';
 import { logger } from '../utils/logger.js';
+import { getProjectRoot } from '../utils/project.js';
 import { isValidProjectPath, sanitizeFtsQuery, validateTags } from '../utils/security.js';
 
 export type SearchInputType = z.infer<typeof SearchInput>;
@@ -44,6 +45,10 @@ export const PruneInput = z.object({
 export type StatsInputType = z.infer<typeof StatsInput>;
 export const StatsInput = z.object({
   project: z.string().optional().describe('Project filter'),
+  format: z
+    .enum(['compact', 'json'])
+    .default('compact')
+    .describe('compact one-liner or structured JSON'),
 });
 
 export type UpdateInputType = z.infer<typeof UpdateInput>;
@@ -110,7 +115,8 @@ export function deleteMemory(db: Database.Database, input: DeleteInputType): str
 
 export function getContext(db: Database.Database, input: ContextInputType): string {
   const now = Math.floor(Date.now() / 1000);
-  const project = input.project ?? process.cwd();
+  // Bind to git-root by default so sub-directory cwd doesn't fragment memories.
+  const project = input.project ?? getProjectRoot();
 
   // Get pinned memories first (always included)
   const pinned = db
@@ -152,6 +158,46 @@ export function getContext(db: Database.Database, input: ContextInputType): stri
   return `${results.length}|${tokensUsed}tk:\n${results.join('\n|\n')}`;
 }
 
+export type RelatedInputType = z.infer<typeof RelatedInput>;
+export const RelatedInput = z.object({
+  id: z.number().describe('Memory ID to find neighbors for'),
+  limit: z.number().min(1).max(20).default(5).describe('Max neighbors to return'),
+  min_strength: z.number().min(0).max(1).default(0.1).describe('Minimum link strength'),
+});
+
+export function getRelated(db: Database.Database, input: RelatedInputType): string {
+  const source = db.prepare('SELECT id, title FROM memories WHERE id = ?').get(input.id) as
+    | { id: number; title: string }
+    | undefined;
+  if (!source) return `Memory #${input.id} not found.`;
+
+  const neighbors = db
+    .prepare(
+      `
+    SELECT m.id, m.type, m.title, l.strength, l.kind
+    FROM memory_links l
+    JOIN memories m ON m.id = l.target_id
+    WHERE l.source_id = ? AND l.strength >= ?
+    ORDER BY l.strength DESC
+    LIMIT ?
+  `
+    )
+    .all(input.id, input.min_strength, input.limit) as {
+    id: number;
+    type: string;
+    title: string;
+    strength: number;
+    kind: string;
+  }[];
+
+  if (neighbors.length === 0) return `No neighbors for #${input.id}: "${source.title}".`;
+
+  const lines = neighbors.map(
+    (n) => `  #${n.id} [${n.type}] ${n.title} (${n.kind}, ${n.strength.toFixed(2)})`
+  );
+  return `#${input.id} "${source.title}" → ${neighbors.length} neighbor(s):\n${lines.join('\n')}`;
+}
+
 export type ExportInputType = z.infer<typeof ExportInput>;
 export const ExportInput = z.object({
   format: z.enum(['json', 'markdown']).default('json').describe('Export format'),
@@ -163,7 +209,9 @@ export function exportMemories(db: Database.Database, input: ExportInputType): s
     ? `WHERE type IN (${input.types.map(() => '?').join(',')})`
     : '';
   const params = input.types ?? [];
-  const rows = db.prepare(`SELECT * FROM memories ${typeFilter} ORDER BY type, created_at DESC`).all(...params) as Memory[];
+  const rows = db
+    .prepare(`SELECT * FROM memories ${typeFilter} ORDER BY type, created_at DESC`)
+    .all(...params) as Memory[];
 
   if (rows.length === 0) return 'No memories to export.';
 
@@ -178,7 +226,10 @@ export function exportMemories(db: Database.Database, input: ExportInputType): s
   }
   const sections = Object.entries(grouped).map(([type, mems]) => {
     const items = mems
-      .map((m) => `- **#${m.id} ${m.title}**${m.pinned ? ' 📌' : ''} (imp:${m.importance})\n  ${m.body.slice(0, 200)}`)
+      .map(
+        (m) =>
+          `- **#${m.id} ${m.title}**${m.pinned ? ' 📌' : ''} (imp:${m.importance})\n  ${m.body.slice(0, 200)}`
+      )
       .join('\n');
     return `## ${type}\n${items}`;
   });
@@ -206,17 +257,20 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     if (input.project) params.push(input.project);
     params.push(now);
 
+    // Title weighted ~10x over body so exact-title matches dominate;
+    // tags weighted 3x because they're usually curated vocabulary.
+    const { title: wt, body: wb, tags: wtags } = SCORING.BM25_WEIGHTS;
     rows = db
       .prepare(
         `
-      SELECT m.*, fts.rank as fts_rank
-      FROM memories_fts fts
-      JOIN memories m ON m.id = fts.rowid
+      SELECT m.*, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) as fts_rank
+      FROM memories_fts
+      JOIN memories m ON m.id = memories_fts.rowid
       WHERE memories_fts MATCH ?
         ${typeFilter}
         ${projectFilter}
         AND (m.expires_at IS NULL OR m.expires_at > ?)
-      ORDER BY fts.rank
+      ORDER BY fts_rank
       LIMIT 25
     `
       )
@@ -275,13 +329,34 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
   if (input.tags && !validateTags(input.tags)) {
     return 'Error: Invalid tags format.';
   }
+
+  // Bind project-typed memories to git-root when caller didn't specify one.
+  // Avoids fragmenting memories across sub-directories of the same repo.
+  const resolvedProject = input.project ?? (input.type === 'project' ? getProjectRoot() : null);
   // Default TTL for project type to prevent zombie memories
   const ttl = input.ttl_days ?? DEFAULT_TTL_DAYS[input.type];
   const expiresAt = ttl ? now + ttl * TIME.DAY : null;
 
-  // Guard 1: session limit
+  // Guard 1: session limit. When rate-limited we surface the three lowest-scoring
+  // memories so the caller has actionable prune candidates instead of a blunt
+  // "wait for next session" wall.
   if (!canSave()) {
-    return `Session save limit reached (${CONFIG.MAX_SAVES_PER_SESSION}/session). Use memory_prune to free space or wait for new session.`;
+    const candidates = db
+      .prepare(
+        `SELECT id, type, title, importance, access_count, created_at, accessed_at, expires_at
+         FROM memories WHERE pinned = 0`
+      )
+      .all() as Memory[];
+    const worst = candidates
+      .map((m) => ({ m, score: scoreMemory(m) }))
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 3)
+      .map(({ m, score }) => `  #${m.id} [${m.type}] ${m.title} (score ${score.toFixed(2)})`)
+      .join('\n');
+    const tail = worst
+      ? `\nLowest-score candidates to prune:\n${worst}\nUse memory_delete <id> or memory_prune.`
+      : '\nUse memory_prune dry_run=false to free space.';
+    return `Session save limit reached (${CONFIG.MAX_SAVES_PER_SESSION}/session).${tail}`;
   }
 
   // Guard 2: hard cap enforcement — evict lowest-score if at limit
@@ -302,26 +377,53 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     db.prepare('DELETE FROM memories WHERE id = ?').run(worst.id);
   }
 
-  // Guard 3: fuzzy title match (normalized lowercase, strip punctuation)
+  // Guard 3: fuzzy match. A title hit alone is NOT enough — we also require the
+  // bodies to look alike, otherwise we merge unrelated memories that happen to
+  // share topic words ("Fixed login bug" vs "Fixed logout bug"). Jaccard on
+  // word bags is cheap and good enough for sub-200-row tables.
   const normalize = (s: string) =>
     s
       .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
       .trim();
-  const normTitle = normalize(input.title);
-  const similar = (
-    db.prepare('SELECT id, title FROM memories WHERE type = ?').all(input.type) as {
-      id: number;
-      title: string;
-    }[]
-  ).find((m) => {
-    const nt = normalize(m.title);
-    // Simple overlap: if one title contains 70%+ of the other's words
-    const aWords = new Set(normTitle.split(' ').filter((w) => w.length > 3));
-    const bWords = new Set(nt.split(' ').filter((w) => w.length > 3));
-    if (aWords.size === 0) return false;
-    const overlap = [...aWords].filter((w) => bWords.has(w)).length;
-    return overlap / aWords.size >= SCORING.FUZZY_MATCH_THRESHOLD;
+  const wordSet = (s: string, minLen = 3): Set<string> =>
+    new Set(
+      normalize(s)
+        .split(' ')
+        .filter((w) => w.length >= minLen)
+    );
+  const jaccard = (a: Set<string>, b: Set<string>): number => {
+    if (a.size === 0 && b.size === 0) return 1;
+    if (a.size === 0 || b.size === 0) return 0;
+    let inter = 0;
+    for (const w of a) if (b.has(w)) inter++;
+    return inter / (a.size + b.size - inter);
+  };
+
+  const inputTitleWords = wordSet(input.title);
+  const inputBodyWords = wordSet(input.body);
+  const candidates = db
+    .prepare('SELECT id, title, body FROM memories WHERE type = ?')
+    .all(input.type) as { id: number; title: string; body: string }[];
+
+  const similar = candidates.find((m) => {
+    const titleWords = wordSet(m.title);
+    if (inputTitleWords.size === 0 || titleWords.size === 0) return false;
+    let overlap = 0;
+    for (const w of inputTitleWords) if (titleWords.has(w)) overlap++;
+    // Containment-based similarity: if the shorter title is fully contained in
+    // the longer one, it's the "same topic". Overlap divided by the smaller
+    // set catches "X documented" vs "X documented here" while still rejecting
+    // "Fixed login bug" vs "Fixed logout bug".
+    const titleSim = overlap / Math.min(inputTitleWords.size, titleWords.size);
+    if (titleSim < SCORING.FUZZY_MATCH_THRESHOLD) return false;
+
+    // Title looks like a dup — confirm with body. Short bodies always pass
+    // because we can't compute a meaningful Jaccard on <3 words.
+    if (inputBodyWords.size < 3) return true;
+    const bodySim = jaccard(inputBodyWords, wordSet(m.body));
+    return bodySim >= SCORING.FUZZY_BODY_SIMILARITY_MIN;
   });
 
   if (similar) {
@@ -360,7 +462,7 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
       input.type,
       input.title,
       input.body,
-      input.project ?? null,
+      resolvedProject,
       JSON.stringify(input.tags),
       input.importance,
       input.pinned ? 1 : 0,
@@ -370,7 +472,136 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     );
 
   recordSave();
-  return `Saved memory #${result.lastInsertRowid}: "${input.title}" [${input.type}]`;
+
+  const newId = Number(result.lastInsertRowid);
+  const linkCount = autoLinkMemory(db, newId, input.title, input.body);
+  const linkTail = linkCount > 0 ? ` (+${linkCount} link${linkCount === 1 ? '' : 's'})` : '';
+  return `Saved memory #${newId}: "${input.title}" [${input.type}]${linkTail}`;
+}
+
+// Tiny English stopword set — enough to strip the highest-noise words before
+// we build an OR query. Not about language support; it's about query quality.
+const LINK_STOPWORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'from',
+  'into',
+  'that',
+  'this',
+  'which',
+  'when',
+  'then',
+  'than',
+  'over',
+  'under',
+  'your',
+  'have',
+  'will',
+  'been',
+  'were',
+  'they',
+  'them',
+  'their',
+  'these',
+  'those',
+  'some',
+  'more',
+  'most',
+  'other',
+  'such',
+  'only',
+  'same',
+  'each',
+  'very',
+  'also',
+  'here',
+  'there',
+]);
+
+/**
+ * Extract a small set of high-signal keywords suitable for an FTS5 OR query.
+ * Strips punctuation, lowercases, filters short and stopword tokens, dedups,
+ * and caps at `maxTerms`. Returns an empty string when there's not enough
+ * signal to link on.
+ */
+function buildFtsOrQuery(text: string, maxTerms = 8): string {
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !LINK_STOPWORDS.has(w));
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const t of tokens) {
+    if (seen.has(t)) continue;
+    seen.add(t);
+    unique.push(t);
+    if (unique.length >= maxTerms) break;
+  }
+  if (unique.length === 0) return '';
+  return unique.join(' OR ');
+}
+
+/**
+ * Auto-link a freshly-inserted memory to the top-N most similar existing ones.
+ *
+ * Uses the FTS5 index the memory was just indexed in. Strength is derived from
+ * BM25 magnitude normalized against SCORING.FTS_RANK_NORM so it stays in [0, 1].
+ * Symmetric links (target → source) are created too because for "related" kind
+ * the semantics are undirected.
+ *
+ * NOTE on query shape: FTS5 MATCH defaults to AND between terms. Using the
+ * full title+body (which can be hundreds of words) would almost never match
+ * anything. We therefore extract up to ~8 high-signal keywords and OR them.
+ */
+function autoLinkMemory(db: Database.Database, newId: number, title: string, body: string): number {
+  try {
+    const query = buildFtsOrQuery(`${title} ${body}`);
+    if (!query) return 0;
+
+    const { title: wt, body: wb, tags: wtags } = SCORING.BM25_WEIGHTS;
+    const rows = db
+      .prepare(
+        `
+      SELECT m.id, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) as rank
+      FROM memories_fts
+      JOIN memories m ON m.id = memories_fts.rowid
+      WHERE memories_fts MATCH ?
+        AND m.id != ?
+      ORDER BY rank
+      LIMIT 3
+    `
+      )
+      .all(query, newId) as { id: number; rank: number }[];
+
+    if (rows.length === 0) return 0;
+
+    // Strength = position-based halving (0.9, 0.6, 0.3 for top-3).
+    // Using raw BM25 magnitude was unreliable because it scales with corpus
+    // size — small corpora produce tiny magnitudes that fail any absolute
+    // threshold even for true matches. Rank order is the stable signal.
+    const POSITION_STRENGTH = [0.9, 0.6, 0.3];
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO memory_links (source_id, target_id, strength, kind)
+       VALUES (?, ?, ?, 'related')`
+    );
+    let created = 0;
+    const tx = db.transaction((links: { id: number; rank: number }[]) => {
+      links.forEach((link, idx) => {
+        const strength = POSITION_STRENGTH[idx] ?? 0.2;
+        insert.run(newId, link.id, strength);
+        insert.run(link.id, newId, strength);
+        created++;
+      });
+    });
+    tx(rows);
+    return created;
+  } catch {
+    // Linking is best-effort; never break saves over it.
+    return 0;
+  }
 }
 
 export function pruneMemories(db: Database.Database, input: z.infer<typeof PruneInput>): string {
@@ -426,10 +657,41 @@ export function getStats(db: Database.Database, input: z.infer<typeof StatsInput
   const oldest = db
     .prepare(`SELECT MIN(created_at) as ts FROM memories ${projectFilter}`)
     .get(...params) as { ts: number | null };
+  const pinned = db
+    .prepare(
+      `SELECT COUNT(*) as n FROM memories ${projectFilter ? projectFilter + ' AND' : 'WHERE'} pinned = 1`
+    )
+    .get(...params) as { n: number };
+
+  const sess = sessionStats();
+
+  if (input.format === 'json') {
+    const byType: Record<string, number> = {};
+    for (const r of counts) byType[r.type] = r.count;
+    return JSON.stringify(
+      {
+        total: total.n,
+        pinned: pinned.n,
+        by_type: byType,
+        oldest: oldest.ts ? new Date(oldest.ts * 1000).toISOString() : null,
+        session: {
+          saves_used: sess.saves,
+          saves_remaining: sess.remaining,
+          max_per_session: CONFIG.MAX_SAVES_PER_SESSION,
+        },
+        capacity: {
+          used: total.n,
+          limit: CONFIG.MAX_MEMORIES,
+        },
+        project: input.project ?? null,
+      },
+      null,
+      2
+    );
+  }
 
   const typeSummary = counts.map((r) => `${r.type[0]}:${r.count}`).join(' ');
   const oldestStr = oldest.ts ? new Date(oldest.ts * 1000).toISOString().split('T')[0] : 'N/A';
-  const sess = sessionStats();
 
-  return `M:${total.n} ${typeSummary} ${oldestStr} S:${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION}`;
+  return `M:${total.n}/${CONFIG.MAX_MEMORIES} ${typeSummary} pin:${pinned.n} ${oldestStr} S:${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION}`;
 }

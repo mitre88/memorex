@@ -11,6 +11,7 @@ import {
   DeleteInput,
   ContextInput,
   ExportInput,
+  RelatedInput,
   type SearchInputType,
   type SaveInputType,
   type PruneInputType,
@@ -19,6 +20,7 @@ import {
   type DeleteInputType,
   type ContextInputType,
   type ExportInputType,
+  type RelatedInputType,
   searchMemories,
   saveMemory,
   pruneMemories,
@@ -27,11 +29,12 @@ import {
   deleteMemory,
   getContext,
   exportMemories,
+  getRelated,
 } from './tools/index.js';
 
 const server = new McpServer({
   name: 'memorex',
-  version: '0.1.0',
+  version: '0.3.0',
 });
 
 const db = getDb();
@@ -113,6 +116,16 @@ server.tool(
   // eslint-disable-next-line @typescript-eslint/require-await
   async (input: ExportInputType) => ({
     content: [{ type: 'text', text: exportMemories(db, input) }],
+  })
+);
+
+server.tool(
+  'memory_related',
+  'List neighbors of a memory in the knowledge graph',
+  RelatedInput.shape,
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async (input: RelatedInputType) => ({
+    content: [{ type: 'text', text: getRelated(db, input) }],
   })
 );
 

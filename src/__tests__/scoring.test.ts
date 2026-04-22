@@ -48,10 +48,28 @@ describe('scoreMemory', () => {
     expect(user).toBeGreaterThan(project);
   });
 
-  it('incorporates FTS rank when provided', () => {
-    const withoutFts = scoreMemory(baseMemory);
-    const withFts = scoreMemory(baseMemory, 0.5);
-    expect(withFts).not.toBe(withoutFts);
+  it('ignores positive FTS ranks (fallback path)', () => {
+    // Positive fts_rank is what the broken pre-0.3.0 code branched on. In SQLite
+    // BM25 never returns positives for real matches, so treat as "no signal".
+    const fallback = scoreMemory(baseMemory, 0);
+    const positive = scoreMemory(baseMemory, 0.5);
+    expect(positive).toBe(fallback);
+  });
+
+  it('uses FTS rank magnitude when negative (real BM25 match)', () => {
+    // Regression: before v0.3.0 the BM25 sign check was inverted and FTS rank
+    // was effectively ignored. Negative rank → relevance boost.
+    const weak = scoreMemory(baseMemory, -1);
+    const strong = scoreMemory(baseMemory, -8);
+    expect(strong).toBeGreaterThan(weak);
+  });
+
+  it('caps FTS relevance at the configured norm', () => {
+    // Extremely strong match should not explode the score unboundedly.
+    const capped = scoreMemory(baseMemory, -1000);
+    const strong = scoreMemory(baseMemory, -10);
+    // With FTS_RANK_NORM=5 both saturate at relevance=1.
+    expect(capped).toBeCloseTo(strong, 5);
   });
 });
 

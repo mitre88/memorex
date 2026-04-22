@@ -52,6 +52,35 @@ function releaseLock(lockDir: string): void {
   }
 }
 
+/** Synchronous sleep used between lock retries. Bounded by SESSION.LOCK_RETRY_* config. */
+function sleepSync(ms: number): void {
+  // Atomics.wait on a private SAB blocks the thread without a busy loop,
+  // which matters when we're running inside tight MCP request paths.
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  Atomics.wait(view, 0, 0, Math.max(1, ms));
+}
+
+/**
+ * Acquire the session lock with bounded exponential backoff.
+ * Returns true only when we actually hold the lock — caller MUST call releaseLock.
+ *
+ * Previous implementation gave up after a single mkdir failure, which in practice
+ * caused `canSave()` to return false under any lock contention (e.g. two MCP calls
+ * racing). That silently ate saves. Retrying for a few ms recovers cleanly because
+ * the critical sections here are microseconds.
+ */
+function acquireLockWithRetry(lockDir: string): boolean {
+  for (let attempt = 0; attempt < SESSION.LOCK_RETRY_ATTEMPTS; attempt++) {
+    if (acquireLock(lockDir)) return true;
+    if (attempt < SESSION.LOCK_RETRY_ATTEMPTS - 1) {
+      const delay = SESSION.LOCK_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      sleepSync(delay);
+    }
+  }
+  return false;
+}
+
 function readState(): SessionState {
   try {
     if (!existsSync(CONFIG.SESSION_FILE)) return fresh();
@@ -93,8 +122,9 @@ function writeState(s: SessionState): void {
 
 export function canSave(): boolean {
   const lockDir = CONFIG.SESSION_FILE + LOCK_DIR_SUFFIX;
-  if (!acquireLock(lockDir)) {
-    // If can't acquire lock, assume another process is saving - be conservative
+  if (!acquireLockWithRetry(lockDir)) {
+    // All retries exhausted — treat as "cannot confirm slot" and deny the save.
+    // This is conservative but now only triggers after sustained contention.
     return false;
   }
   try {
@@ -106,8 +136,8 @@ export function canSave(): boolean {
 
 export function recordSave(): void {
   const lockDir = CONFIG.SESSION_FILE + LOCK_DIR_SUFFIX;
-  if (!acquireLock(lockDir)) {
-    // If can't acquire lock, skip recording (conservative approach)
+  if (!acquireLockWithRetry(lockDir)) {
+    // After full retry budget — skip recording (conservative).
     return;
   }
   try {
@@ -121,7 +151,7 @@ export function recordSave(): void {
 
 export function resetSession(): void {
   const lockDir = CONFIG.SESSION_FILE + LOCK_DIR_SUFFIX;
-  if (!acquireLock(lockDir)) {
+  if (!acquireLockWithRetry(lockDir)) {
     return;
   }
   try {

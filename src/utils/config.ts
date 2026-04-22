@@ -22,7 +22,7 @@ export const SESSION = {
 /** Memory limits and thresholds */
 export const LIMITS = {
   MAX_MEMORIES: 200,
-  MAX_BODY_LENGTH: 1500,
+  MAX_BODY_LENGTH: 4000,
   MAX_DISPLAY_BODY: 500,
   MAX_QUERY_LENGTH: 200,
   MAX_PROJECT_PATH_LENGTH: 500,
@@ -49,10 +49,25 @@ export const SCORING = {
     reference: 0.05,
   } as const,
   DEFAULT_PRUNE_THRESHOLD: 0.1,
-  // Fuzzy match threshold (70% word overlap)
-  FUZZY_MATCH_THRESHOLD: 0.7,
+  // Fuzzy match threshold (word overlap required to treat two titles as duplicates).
+  // Raised from 0.7 → 0.85 because 0.7 collapsed related-but-distinct memories
+  // (e.g. "Fixed login bug" vs "Fixed logout bug" share 66% and incorrectly merged).
+  FUZZY_MATCH_THRESHOLD: 0.85,
+  // Minimum body similarity (Jaccard on word bags) required to treat fuzzy
+  // title matches as the same memory vs distinct. Below this → new memory.
+  FUZZY_BODY_SIMILARITY_MIN: 0.4,
   // Token estimation (chars per token)
   CHARS_PER_TOKEN: 3,
+  // BM25 field weights (title > tags > body). Passed directly to bm25().
+  BM25_WEIGHTS: {
+    title: 10.0,
+    body: 1.0,
+    tags: 3.0,
+  } as const,
+  // Normalization divisor used to map SQLite BM25 magnitude into [0, 1].
+  // BM25 in SQLite returns negative floats (typical range -0.x to -20+).
+  // Divisor of 5 maps rank −5 → ~1.0, −1 → 0.2.
+  FTS_RANK_NORM: 5,
 } as const;
 
 /** Default TTL for memory types in days */
