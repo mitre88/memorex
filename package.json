@@ -1,7 +1,7 @@
 {
   "name": "memorex",
-  "version": "0.3.0",
-  "description": "Passive memory layer for Claude Code — auto-inject, pre-compact snapshot, knowledge graph, SQLite FTS5",
+  "version": "0.4.0",
+  "description": "Passive memory layer for Claude Code — CLI + auto-inject, pre-compact snapshot, subagent capture, knowledge graph, revision history, SQLite FTS5",
   "type": "module",
   "bin": {
     "memorex": "./dist/index.js"
@@ -45,9 +45,11 @@
   },
   "keywords": [
     "claude",
+    "claude-code",
     "mcp",
     "memory",
-    "sqlite"
+    "sqlite",
+    "cli"
   ],
   "author": "mitre88",
   "license": "MIT"

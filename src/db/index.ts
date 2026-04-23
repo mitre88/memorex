@@ -71,6 +71,22 @@ function migrateSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_memory_links_source ON memory_links(source_id);
     CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_id);
   `);
+
+  // v0.4.0: append-only revision history. Captures the PREVIOUS body/tags
+  // every time a memory is updated so edits are recoverable.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_revisions (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      memory_id    INTEGER NOT NULL,
+      body         TEXT NOT NULL,
+      tags         TEXT NOT NULL DEFAULT '[]',
+      importance   REAL NOT NULL DEFAULT 0.5,
+      revised_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+      reason       TEXT,
+      FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory ON memory_revisions(memory_id);
+  `);
 }
 
 function initSchema(db: Database.Database): void {

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] - 2026-04-23
+
+### Added
+
+- **CLI** — the `memorex` binary now dispatches to a full CLI when invoked with
+  arguments. Commands: `ls`, `search`, `show`, `pin`, `unpin`, `rm`, `stats`,
+  `history`, `prune`, `backup`, `import`, `version`, `help`. Calling with no
+  args (the MCP stdio invocation path) still starts the MCP server.
+- **`SubagentStop` hook** — captures the synthesized result of every sub-agent
+  delegation as a `feedback` memory tagged `subagent` and `agent-<name>` with
+  a 30-day TTL. Makes past delegations searchable.
+- **Importers** — bootstrap memorex from existing knowledge bases:
+  `memorex import --from claude-md <path>` (one memory per H2 section),
+  `--from obsidian <vault>` (one memory per `.md`, folder path as tags),
+  `--from engram <json>` (array of observations or
+  `{ observations: [...] }`). All bypass the session save rate limit but
+  respect the 200-memory hard cap.
+- **Revision history** — new `memory_revisions` table captures the previous
+  `body`, `tags`, and `importance` every time a memory is updated (manual,
+  upsert, or fuzzy merge). New `memory_history` MCP tool (and
+  `memorex history <id>` CLI command) lists recent revisions with reason
+  codes (`manual-update`, `upsert`, `fuzzy-merge`).
+
+### Changed
+
+- `install.sh` now also wires the `SubagentStop` hook.
+- MCP server moved to `src/mcp.ts`; `src/index.ts` is now a dispatcher.
+
 ## [0.3.0] - 2026-04-21
 
 ### Fixed
@@ -56,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reasonable length before trusting it (does NOT force-scope to `$HOME`, which
   would break repos in system paths).
 
-## [Unreleased]
+## [0.2.0] - 2025 pre-release — infrastructure pass
 
 ### Added
 
@@ -103,6 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mitre88/memorex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mitre88/memorex/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/mitre88/memorex/releases/tag/v0.1.0

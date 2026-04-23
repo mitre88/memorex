@@ -15,6 +15,28 @@ chmod +x install.sh
 
 Restart Claude Code after installing.
 
+## CLI
+
+The same `memorex` binary ships a CLI so you can inspect and manage the local database without opening Claude Code:
+
+```bash
+memorex ls                      # list recent memories
+memorex search "auth"           # FTS search
+memorex show 42                 # print a single memory
+memorex pin 42                  # pin / unpin so decay doesn't touch it
+memorex rm 42                   # delete a memory
+memorex history 42              # revision history for #42
+memorex stats                   # compact one-liner (add --json for JSON)
+memorex prune --yes             # really delete cold memories
+memorex backup                  # copy the db into ~/.memorex/backups
+memorex import --from claude-md ~/.claude/CLAUDE.md
+memorex import --from obsidian  ~/Documents/Obsidian\ Vault
+memorex import --from engram    ~/engram-dump.json
+memorex help
+```
+
+Calling `memorex` with no arguments still starts the MCP stdio server (that's how Claude Code launches it).
+
 ## Development
 
 ```bash
@@ -74,6 +96,7 @@ src/
 | `memory_context` | Auto-context: top memories for current git-root project |
 | `memory_export`  | Export memories as JSON or markdown                     |
 | `memory_related` | List knowledge-graph neighbors of a memory              |
+| `memory_history` | Show revision history of a memory over time             |
 
 ## Session Hooks
 
@@ -83,6 +106,7 @@ src/
 | `UserPromptSubmit` | Every user prompt   | Auto-injects top-3 relevant memories (budget 500 tokens, zero if empty) |
 | `PreCompact`       | Before compaction   | Snapshots recent prompts + files into a 7-day memory                    |
 | `Stop`             | Closing Claude Code | Silently prunes expired/cold memories (0 token cost)                    |
+| `SubagentStop`     | Sub-agent finishes  | Saves the sub-agent's final result as a `feedback` memory (30-day TTL)  |
 
 ## Limits
 

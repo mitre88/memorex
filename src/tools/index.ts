@@ -60,6 +60,66 @@ export const UpdateInput = z.object({
   tags: z.array(z.string()).optional().describe('New tags'),
 });
 
+export type HistoryInputType = z.infer<typeof HistoryInput>;
+export const HistoryInput = z.object({
+  id: z.number().describe('Memory ID to inspect'),
+  limit: z.number().min(1).max(50).default(10).describe('Max revisions to return'),
+});
+
+/**
+ * Append the PREVIOUS state of a memory to memory_revisions before overwriting
+ * it. Called from any path that mutates body/tags/importance. Best-effort —
+ * never breaks the caller's write.
+ */
+function recordRevision(db: Database.Database, id: number, reason: string): void {
+  try {
+    const prev = db.prepare('SELECT body, tags, importance FROM memories WHERE id = ?').get(id) as
+      | { body: string; tags: string; importance: number }
+      | undefined;
+    if (!prev) return;
+    db.prepare(
+      `INSERT INTO memory_revisions (memory_id, body, tags, importance, reason)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(id, prev.body, prev.tags, prev.importance, reason);
+  } catch {
+    // Revisions are an audit trail; never block the primary write.
+  }
+}
+
+export function getHistory(db: Database.Database, input: HistoryInputType): string {
+  const current = db
+    .prepare('SELECT id, title, body, tags, importance FROM memories WHERE id = ?')
+    .get(input.id) as
+    | { id: number; title: string; body: string; tags: string; importance: number }
+    | undefined;
+  if (!current) return `Memory #${input.id} not found.`;
+
+  const revs = db
+    .prepare(
+      `SELECT id, body, tags, importance, revised_at, reason
+       FROM memory_revisions WHERE memory_id = ?
+       ORDER BY revised_at DESC LIMIT ?`
+    )
+    .all(input.id, input.limit) as {
+    id: number;
+    body: string;
+    tags: string;
+    importance: number;
+    revised_at: number;
+    reason: string | null;
+  }[];
+
+  const lines: string[] = [];
+  lines.push(`#${current.id} "${current.title}" — current + ${revs.length} revision(s)`);
+  lines.push(`  now: imp=${current.importance} ${current.body.slice(0, 120)}`);
+  for (const r of revs) {
+    const ts = new Date(r.revised_at * 1000).toISOString().split('T')[0];
+    const reason = r.reason ? ` (${r.reason})` : '';
+    lines.push(`  ${ts}${reason}: imp=${r.importance} ${r.body.slice(0, 120)}`);
+  }
+  return lines.join('\n');
+}
+
 export type DeleteInputType = z.infer<typeof DeleteInput>;
 export const DeleteInput = z.object({
   id: z.number().describe('Memory ID to delete'),
@@ -76,6 +136,11 @@ export function updateMemory(db: Database.Database, input: UpdateInputType): str
     | { id: number }
     | undefined;
   if (!existing) return `Memory #${input.id} not found.`;
+
+  // Snapshot previous state before mutating — only if body/tags/importance change.
+  if (input.body !== undefined || input.tags !== undefined || input.importance !== undefined) {
+    recordRevision(db, input.id, 'manual-update');
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const sets: string[] = ['accessed_at = ?'];
@@ -427,6 +492,7 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
   });
 
   if (similar) {
+    recordRevision(db, similar.id, 'fuzzy-merge');
     db.prepare(
       'UPDATE memories SET body = ?, tags = ?, importance = ?, accessed_at = ? WHERE id = ?'
     ).run(
@@ -445,6 +511,7 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     .get(input.type, input.title) as { id: number } | undefined;
 
   if (existing) {
+    recordRevision(db, existing.id, 'upsert');
     db.prepare(
       'UPDATE memories SET body = ?, tags = ?, importance = ?, accessed_at = ?, expires_at = ? WHERE id = ?'
     ).run(input.body, JSON.stringify(input.tags), input.importance, now, expiresAt, existing.id);

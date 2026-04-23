@@ -1,133 +1,28 @@
 #!/usr/bin/env node
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { getDb } from './db/index.js';
-import {
-  SearchInput,
-  SaveInput,
-  PruneInput,
-  StatsInput,
-  UpdateInput,
-  DeleteInput,
-  ContextInput,
-  ExportInput,
-  RelatedInput,
-  type SearchInputType,
-  type SaveInputType,
-  type PruneInputType,
-  type StatsInputType,
-  type UpdateInputType,
-  type DeleteInputType,
-  type ContextInputType,
-  type ExportInputType,
-  type RelatedInputType,
-  searchMemories,
-  saveMemory,
-  pruneMemories,
-  getStats,
-  updateMemory,
-  deleteMemory,
-  getContext,
-  exportMemories,
-  getRelated,
-} from './tools/index.js';
+/**
+ * Entry point — dispatches to either the CLI or the MCP stdio server.
+ *
+ * When invoked with any argv (e.g. `memorex ls`, `memorex search foo`) we run
+ * the CLI. When invoked with no arguments (how Claude Code launches MCP
+ * servers over stdio) or with `--mcp`, we boot the MCP server.
+ */
+import { runCli } from './cli.js';
+import { runMcpServer } from './mcp.js';
 
-const server = new McpServer({
-  name: 'memorex',
-  version: '0.3.0',
+const argv = process.argv.slice(2);
+const first = argv[0];
+
+async function main(): Promise<void> {
+  if (argv.length === 0 || first === '--mcp') {
+    await runMcpServer();
+    return;
+  }
+  const code = runCli(argv);
+  process.exit(code);
+}
+
+main().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  process.stderr.write(`memorex: ${msg}\n`);
+  process.exit(1);
 });
-
-const db = getDb();
-
-server.tool(
-  'memory_search',
-  'Find relevant memories within token budget',
-  SearchInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: SearchInputType) => ({
-    content: [{ type: 'text', text: searchMemories(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_save',
-  'Save or update a memory (deduped)',
-  SaveInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: SaveInputType) => ({
-    content: [{ type: 'text', text: saveMemory(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_prune',
-  'Remove expired/low-relevance memories',
-  PruneInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: PruneInputType) => ({
-    content: [{ type: 'text', text: pruneMemories(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_stats',
-  'Memory count and session budget',
-  StatsInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: StatsInputType) => ({
-    content: [{ type: 'text', text: getStats(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_update',
-  'Update a memory by ID',
-  UpdateInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: UpdateInputType) => ({
-    content: [{ type: 'text', text: updateMemory(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_delete',
-  'Delete a memory by ID',
-  DeleteInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: DeleteInputType) => ({
-    content: [{ type: 'text', text: deleteMemory(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_context',
-  'Auto-context: top memories for current project',
-  ContextInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: ContextInputType) => ({
-    content: [{ type: 'text', text: getContext(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_export',
-  'Export memories as JSON or markdown',
-  ExportInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: ExportInputType) => ({
-    content: [{ type: 'text', text: exportMemories(db, input) }],
-  })
-);
-
-server.tool(
-  'memory_related',
-  'List neighbors of a memory in the knowledge graph',
-  RelatedInput.shape,
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async (input: RelatedInputType) => ({
-    content: [{ type: 'text', text: getRelated(db, input) }],
-  })
-);
-
-const transport = new StdioServerTransport();
-await server.connect(transport);

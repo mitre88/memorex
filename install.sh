@@ -65,8 +65,17 @@ if (!s.hooks.PreCompact.some(g => g.hooks?.some(h => h.command?.includes('memore
   });
 }
 
+// SubagentStop: capture sub-agent conclusions as feedback memories
+s.hooks.SubagentStop = s.hooks.SubagentStop || [];
+if (!s.hooks.SubagentStop.some(g => g.hooks?.some(h => h.command?.includes('memorex')))) {
+  s.hooks.SubagentStop.push({
+    matcher: '',
+    hooks: [{ type: 'command', command: 'node ' + cwd + '/dist/hooks/subagent.js 2>/dev/null || true' }]
+  });
+}
+
 fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
-console.log('Configured: MCP server + SessionStart/Stop/UserPromptSubmit/PreCompact hooks');
+console.log('Configured: MCP server + SessionStart/Stop/UserPromptSubmit/PreCompact/SubagentStop hooks');
 "
 
 echo ""

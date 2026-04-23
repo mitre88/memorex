@@ -10,7 +10,11 @@ import {
   getStats,
   getRelated,
   deleteMemory,
+  updateMemory,
+  getHistory,
 } from '../tools/index.js';
+import { runImport } from '../importers.js';
+import { writeFileSync, mkdirSync } from 'fs';
 import { resetSession, canSave, recordSave } from '../utils/session.js';
 
 const originalEnv = process.env.HOME;
@@ -60,6 +64,16 @@ describe('tools', () => {
         PRIMARY KEY (source_id, target_id, kind),
         FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
         FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS memory_revisions (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id    INTEGER NOT NULL,
+        body         TEXT NOT NULL,
+        tags         TEXT NOT NULL DEFAULT '[]',
+        importance   REAL NOT NULL DEFAULT 0.5,
+        revised_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+        reason       TEXT,
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
       );
     `);
   });
@@ -257,6 +271,53 @@ describe('tools', () => {
       expect(result).toContain('neighbor');
     });
 
+    it('records a revision on manual update and getHistory surfaces it', () => {
+      saveMemory(db, {
+        type: 'project',
+        title: 'Cache layer design',
+        body: 'Initial Redis plan with 1h TTL on warm keys',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      updateMemory(db, { id: 1, body: 'Switched to Memcached after load tests', importance: 0.7 });
+      const revs = db.prepare('SELECT * FROM memory_revisions WHERE memory_id = 1').all() as {
+        body: string;
+        reason: string;
+      }[];
+      expect(revs.length).toBe(1);
+      expect(revs[0].body).toContain('Redis');
+      expect(revs[0].reason).toBe('manual-update');
+
+      const history = getHistory(db, { id: 1, limit: 10 });
+      expect(history).toContain('revision(s)');
+      expect(history).toContain('Redis');
+    });
+
+    it('records a revision on upsert (same title)', () => {
+      saveMemory(db, {
+        type: 'project',
+        title: 'Retry policy',
+        body: 'Exponential backoff up to 3 attempts',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Retry policy',
+        body: 'Use jittered exponential with circuit breaker',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      const revs = db.prepare('SELECT reason FROM memory_revisions WHERE memory_id = 1').all() as {
+        reason: string;
+      }[];
+      expect(revs.length).toBe(1);
+      expect(revs[0].reason).toBe('upsert');
+    });
+
     it('cascade-deletes links when memory is deleted', () => {
       saveMemory(db, {
         type: 'project',
@@ -279,6 +340,89 @@ describe('tools', () => {
       deleteMemory(db, { id: 1 });
       const after = db.prepare('SELECT COUNT(*) as n FROM memory_links').get() as { n: number };
       expect(after.n).toBe(0);
+    });
+  });
+
+  describe('importers', () => {
+    it('imports a CLAUDE.md by H2 sections', () => {
+      const md = [
+        '# Project Title',
+        '',
+        'Intro blurb (skipped — no H2 yet).',
+        '',
+        '## Environment',
+        '',
+        'macOS with Apple Silicon and Node 20 LTS pinned via nvmrc.',
+        '',
+        '## Conventions',
+        '',
+        'Always use functional style, prefer recursion, prioritize native libs.',
+      ].join('\n');
+      const path = join(tempDir, 'CLAUDE.md');
+      writeFileSync(path, md);
+      const result = runImport(db, 'claude-md', path);
+      expect(result.imported).toBe(2);
+      const rows = db.prepare('SELECT title FROM memories ORDER BY id').all() as {
+        title: string;
+      }[];
+      expect(rows[0].title).toContain('Environment');
+      expect(rows[1].title).toContain('Conventions');
+    });
+
+    it('imports an obsidian vault recursively', () => {
+      const vault = join(tempDir, 'vault');
+      const folder = join(vault, 'notes');
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(
+        join(folder, 'auth.md'),
+        'JWT with httpOnly cookies, refresh rotation on every request.'
+      );
+      writeFileSync(
+        join(folder, 'cache.md'),
+        'Redis in front of Postgres, warm keys TTL one hour, invalidate on write.'
+      );
+      const result = runImport(db, 'obsidian', vault);
+      expect(result.imported).toBe(2);
+      const rows = db.prepare("SELECT tags FROM memories WHERE title = 'auth'").all() as {
+        tags: string;
+      }[];
+      expect(rows[0].tags).toContain('obsidian');
+      expect(rows[0].tags).toContain('notes');
+    });
+
+    it('imports an engram JSON dump with type mapping', () => {
+      const dump = [
+        {
+          title: 'Switched to PNPM workspaces',
+          content: 'Moved from npm to pnpm workspaces for dedup and speed reasons across repos.',
+          type: 'decision',
+          tags: ['monorepo'],
+        },
+        {
+          title: 'User prefers caveman mode',
+          content: 'Terse responses, drop articles and filler, keep technical substance intact.',
+          type: 'preference',
+          tags: [],
+        },
+      ];
+      const path = join(tempDir, 'engram.json');
+      writeFileSync(path, JSON.stringify(dump));
+      const result = runImport(db, 'engram', path);
+      expect(result.imported).toBe(2);
+      const rows = db.prepare('SELECT type FROM memories ORDER BY id').all() as { type: string }[];
+      expect(rows[0].type).toBe('project');
+      expect(rows[1].type).toBe('user');
+    });
+
+    it('dedups on re-import (upsert same title)', () => {
+      const md = '## Section A\n\nSome body text worth remembering for the demo.';
+      const path = join(tempDir, 'a.md');
+      writeFileSync(path, md);
+      const first = runImport(db, 'claude-md', path);
+      expect(first.imported).toBe(1);
+      const second = runImport(db, 'claude-md', path);
+      expect(second.imported).toBe(0);
+      expect(second.skipped).toBe(1);
     });
   });
 });
