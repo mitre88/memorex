@@ -43,7 +43,7 @@ import {
 export async function runMcpServer(): Promise<void> {
   const server = new McpServer({
     name: 'memorex',
-    version: '0.4.0',
+    version: '0.4.1',
   });
 
   const db = getDb();

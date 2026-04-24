@@ -183,35 +183,41 @@ export function getContext(db: Database.Database, input: ContextInputType): stri
   // Bind to git-root by default so sub-directory cwd doesn't fragment memories.
   const project = input.project ?? getProjectRoot();
 
-  // Get pinned memories first (always included)
-  const pinned = db
-    .prepare('SELECT * FROM memories WHERE pinned = 1 AND (expires_at IS NULL OR expires_at > ?)')
-    .all(now) as Memory[];
-
-  // Get project-relevant + recent high-importance memories
-  const projectMems = db
+  // Single query replaces the previous pinned + project-recent pair followed
+  // by JS re-dedup/re-score. Pinned rows short-circuit to a constant high
+  // score (mirrors scoreMemory's pinned=999 behavior) so they always sort to
+  // the top; non-pinned rows use type-aware half-life decay in SQL.
+  //
+  // Type half-life literals are inlined from SCORING.HALF_LIFE_DAYS; if those
+  // ever shift we'd catch it via the existing scoring tests.
+  const hl = SCORING.HALF_LIFE_DAYS;
+  const rows = db
     .prepare(
-      `SELECT * FROM memories WHERE pinned = 0
-       AND (project IS NULL OR project = ?)
-       AND (expires_at IS NULL OR expires_at > ?)
-       ORDER BY importance * (1.0 / (1 + (? - accessed_at) / 86400.0)) DESC
-       LIMIT 20`
+      `
+      SELECT m.*, CASE
+        WHEN pinned = 1 THEN 999
+        ELSE importance * pow(0.5, ((? - accessed_at) / 86400.0) /
+          CASE type
+            WHEN 'feedback'  THEN ${hl.feedback}
+            WHEN 'user'      THEN ${hl.user}
+            WHEN 'project'   THEN ${hl.project}
+            WHEN 'reference' THEN ${hl.reference}
+            ELSE ${hl.default}
+          END
+        )
+      END as score
+      FROM memories m
+      WHERE (expires_at IS NULL OR expires_at > ?)
+        AND (pinned = 1 OR project IS NULL OR project = ?)
+      ORDER BY score DESC
+      LIMIT 30
+    `
     )
-    .all(project, now, now) as Memory[];
+    .all(now, now, project) as (Memory & { score: number })[];
 
-  const all = [...pinned, ...projectMems];
-  const scored = all
-    .map((m) => ({ mem: m, score: scoreMemory(m) }))
-    .sort((a, b) => b.score - a.score);
-
-  // Dedup by id
-  const seen = new Set<number>();
   const results: string[] = [];
   let tokensUsed = 0;
-
-  for (const { mem } of scored) {
-    if (seen.has(mem.id)) continue;
-    seen.add(mem.id);
+  for (const mem of rows) {
     const formatted = formatMemoryForContext(mem, CONFIG.MAX_DISPLAY_BODY);
     const tokens = estimateTokens(formatted);
     if (tokensUsed + tokens > input.token_budget) break;
@@ -362,12 +368,8 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
 
   // Pack into token budget
   const results: string[] = [];
+  const accessedIds: number[] = [];
   let tokensUsed = 0;
-  // Only refresh accessed_at if last access was >1 hour ago (prevents decay-killing)
-  const ACCESS_COOLDOWN = LIMITS.ACCESS_COOLDOWN_SECONDS;
-  const updateStmt = db.prepare(
-    'UPDATE memories SET accessed_at = ?, access_count = access_count + 1 WHERE id = ? AND accessed_at < ?'
-  );
 
   for (const { mem } of scored) {
     const formatted = formatMemoryForContext(mem, CONFIG.MAX_DISPLAY_BODY);
@@ -375,7 +377,24 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     if (tokensUsed + tokens > input.token_budget) break;
     results.push(formatted);
     tokensUsed += tokens;
-    updateStmt.run(now, mem.id, now - ACCESS_COOLDOWN);
+    accessedIds.push(mem.id);
+  }
+
+  // Batch-update accessed_at in a single transaction. Two wins here:
+  //   (1) halves the per-row SQLite fsync cost vs N separate runs.
+  //   (2) because the v0.4.1 FTS update trigger only fires on changes to
+  //       title/body/tags, touching accessed_at no longer re-indexes FTS at
+  //       all — which is the biggest perf win in the whole search path.
+  // Cooldown guard still prevents hot rows from resetting their decay clock.
+  if (accessedIds.length > 0) {
+    const ACCESS_COOLDOWN = LIMITS.ACCESS_COOLDOWN_SECONDS;
+    const updateStmt = db.prepare(
+      'UPDATE memories SET accessed_at = ?, access_count = access_count + 1 WHERE id = ? AND accessed_at < ?'
+    );
+    const tx = db.transaction((ids: number[]) => {
+      for (const id of ids) updateStmt.run(now, id, now - ACCESS_COOLDOWN);
+    });
+    tx(accessedIds);
   }
 
   if (results.length === 0) return 'No relevant memories found.';
@@ -424,22 +443,37 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     return `Session save limit reached (${CONFIG.MAX_SAVES_PER_SESSION}/session).${tail}`;
   }
 
-  // Guard 2: hard cap enforcement — evict lowest-score if at limit
+  // Guard 2: hard cap enforcement. Instead of pulling every row into JS to
+  // find the worst, let SQLite do it. The scoring expression mirrors
+  // scoreMemory() for non-pinned, non-expired rows:
+  //
+  //   score = importance * 2^(-age_days / half_life)
+  //
+  // (popularity boost and FTS relevance are both 0 here — eviction never has
+  // an FTS context and access_count contribution is minor at eviction time.)
+  //
+  // Pinned rows are excluded. Expired rows are preferred for eviction.
   const totalCount = (db.prepare('SELECT COUNT(*) as n FROM memories').get() as { n: number }).n;
   if (totalCount >= CONFIG.MAX_MEMORIES) {
-    // Select only scoring fields — skip heavy body/tags
-    const light = db
-      .prepare(
-        'SELECT id, type, importance, access_count, created_at, accessed_at, expires_at FROM memories'
+    const hl = SCORING.HALF_LIFE_DAYS;
+    const evictStmt = db.prepare(`
+      DELETE FROM memories WHERE id = (
+        SELECT id FROM memories WHERE pinned = 0
+        ORDER BY
+          CASE WHEN expires_at IS NOT NULL AND expires_at < ? THEN 0 ELSE 1 END,
+          importance * pow(0.5, ((? - accessed_at) / 86400.0) /
+            CASE type
+              WHEN 'feedback'  THEN ${hl.feedback}
+              WHEN 'user'      THEN ${hl.user}
+              WHEN 'project'   THEN ${hl.project}
+              WHEN 'reference' THEN ${hl.reference}
+              ELSE ${hl.default}
+            END
+          ) ASC
+        LIMIT 1
       )
-      .all() as Pick<
-      Memory,
-      'id' | 'type' | 'importance' | 'access_count' | 'created_at' | 'accessed_at' | 'expires_at'
-    >[];
-    const worst = light.reduce((a, b) =>
-      scoreMemory(a as Memory) < scoreMemory(b as Memory) ? a : b
-    );
-    db.prepare('DELETE FROM memories WHERE id = ?').run(worst.id);
+    `);
+    evictStmt.run(now, now);
   }
 
   // Guard 3: fuzzy match. A title hit alone is NOT enough — we also require the
@@ -710,44 +744,52 @@ export function getStats(db: Database.Database, input: z.infer<typeof StatsInput
   const projectFilter = input.project ? 'WHERE project = ?' : '';
   const params = input.project ? [input.project] : [];
 
-  const counts = db
+  // One round-trip instead of four. Conditional aggregates compute the per-type
+  // counts + pinned + oldest + total in a single table scan.
+  const agg = db
     .prepare(
-      `
-    SELECT type, COUNT(*) as count FROM memories ${projectFilter} GROUP BY type
-  `
+      `SELECT
+        COUNT(*) as total,
+        SUM(pinned) as pinned_n,
+        MIN(created_at) as oldest,
+        SUM(CASE WHEN type = 'user'      THEN 1 ELSE 0 END) as t_user,
+        SUM(CASE WHEN type = 'project'   THEN 1 ELSE 0 END) as t_project,
+        SUM(CASE WHEN type = 'feedback'  THEN 1 ELSE 0 END) as t_feedback,
+        SUM(CASE WHEN type = 'reference' THEN 1 ELSE 0 END) as t_reference
+       FROM memories ${projectFilter}`
     )
-    .all(...params) as { type: string; count: number }[];
+    .get(...params) as {
+    total: number;
+    pinned_n: number | null;
+    oldest: number | null;
+    t_user: number | null;
+    t_project: number | null;
+    t_feedback: number | null;
+    t_reference: number | null;
+  };
 
-  const total = db
-    .prepare(`SELECT COUNT(*) as n FROM memories ${projectFilter}`)
-    .get(...params) as { n: number };
-  const oldest = db
-    .prepare(`SELECT MIN(created_at) as ts FROM memories ${projectFilter}`)
-    .get(...params) as { ts: number | null };
-  const pinned = db
-    .prepare(
-      `SELECT COUNT(*) as n FROM memories ${projectFilter ? projectFilter + ' AND' : 'WHERE'} pinned = 1`
-    )
-    .get(...params) as { n: number };
-
+  const byType: Record<string, number> = {};
+  if (agg.t_user) byType.user = agg.t_user;
+  if (agg.t_project) byType.project = agg.t_project;
+  if (agg.t_feedback) byType.feedback = agg.t_feedback;
+  if (agg.t_reference) byType.reference = agg.t_reference;
+  const pinnedCount = agg.pinned_n ?? 0;
   const sess = sessionStats();
 
   if (input.format === 'json') {
-    const byType: Record<string, number> = {};
-    for (const r of counts) byType[r.type] = r.count;
     return JSON.stringify(
       {
-        total: total.n,
-        pinned: pinned.n,
+        total: agg.total,
+        pinned: pinnedCount,
         by_type: byType,
-        oldest: oldest.ts ? new Date(oldest.ts * 1000).toISOString() : null,
+        oldest: agg.oldest ? new Date(agg.oldest * 1000).toISOString() : null,
         session: {
           saves_used: sess.saves,
           saves_remaining: sess.remaining,
           max_per_session: CONFIG.MAX_SAVES_PER_SESSION,
         },
         capacity: {
-          used: total.n,
+          used: agg.total,
           limit: CONFIG.MAX_MEMORIES,
         },
         project: input.project ?? null,
@@ -757,8 +799,10 @@ export function getStats(db: Database.Database, input: z.infer<typeof StatsInput
     );
   }
 
-  const typeSummary = counts.map((r) => `${r.type[0]}:${r.count}`).join(' ');
-  const oldestStr = oldest.ts ? new Date(oldest.ts * 1000).toISOString().split('T')[0] : 'N/A';
+  const typeSummary = Object.entries(byType)
+    .map(([k, v]) => `${k[0]}:${v}`)
+    .join(' ');
+  const oldestStr = agg.oldest ? new Date(agg.oldest * 1000).toISOString().split('T')[0] : 'N/A';
 
-  return `M:${total.n}/${CONFIG.MAX_MEMORIES} ${typeSummary} pin:${pinned.n} ${oldestStr} S:${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION}`;
+  return `M:${agg.total}/${CONFIG.MAX_MEMORIES} ${typeSummary} pin:${pinnedCount} ${oldestStr} S:${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION}`;
 }

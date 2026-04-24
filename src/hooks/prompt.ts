@@ -18,20 +18,23 @@
  *   - Self-budgeted to ~500 tokens; tunable via MEMOREX_INJECT_BUDGET env.
  */
 import { readFileSync } from 'fs';
-import { getDb } from '../db/index.js';
+import { getDbReadonly } from '../db/index.js';
 import {
   scoreMemory,
   estimateTokens,
   formatMemoryForContext,
   type Memory,
 } from '../types/scoring.js';
-import { SCORING, SEARCH_DEFAULTS } from '../utils/config.js';
+import { SCORING } from '../utils/config.js';
 import { getProjectRoot } from '../utils/project.js';
 import { sanitizeFtsQuery } from '../utils/security.js';
 
 const INJECT_TOKEN_BUDGET = Number(process.env.MEMOREX_INJECT_BUDGET ?? '500');
 const INJECT_MIN_SCORE = Number(process.env.MEMOREX_INJECT_MIN_SCORE ?? '0.15');
 const INJECT_MAX_RESULTS = Number(process.env.MEMOREX_INJECT_MAX ?? '3');
+// Fetch a few more rows than we'll emit so scoring has headroom after
+// min-score filtering. Anything beyond ~4x the cap is wasted I/O.
+const INJECT_FETCH_LIMIT = Math.max(8, INJECT_MAX_RESULTS * 4);
 // Inject preamble must be unambiguous so Claude treats this as memory, not user text.
 const PREAMBLE = '<memorex-context source="memorex" scope="auto-injected">';
 const POSTAMBLE = '</memorex-context>';
@@ -74,12 +77,11 @@ function main(): void {
   const project = getProjectRoot();
   const now = Math.floor(Date.now() / 1000);
 
-  let db: ReturnType<typeof getDb>;
-  try {
-    db = getDb();
-  } catch {
-    return;
-  }
+  // Read-only open: no migrations run, no journal_mode writes, no chmod.
+  // When the DB file doesn't exist yet, this returns null — fresh install,
+  // nothing to inject, silent exit.
+  const db = getDbReadonly();
+  if (!db) return;
 
   try {
     const { title: wt, body: wb, tags: wtags } = SCORING.BM25_WEIGHTS;
@@ -96,7 +98,7 @@ function main(): void {
       LIMIT ?
     `
       )
-      .all(safe, project, now, SEARCH_DEFAULTS.RESULT_LIMIT) as (Memory & {
+      .all(safe, project, now, INJECT_FETCH_LIMIT) as (Memory & {
       fts_rank: number;
     })[];
 

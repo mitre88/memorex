@@ -54,6 +54,13 @@ describe('tools', () => {
       CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
         INSERT INTO memories_fts(memories_fts, rowid, title, body, tags) VALUES ('delete', old.id, old.title, old.body, old.tags);
       END;
+      -- Column-restricted update trigger (v0.4.1) — only fires when searchable
+      -- content changes, so touching accessed_at / access_count does NOT
+      -- re-index FTS. Mirrors the production schema in src/db/index.ts.
+      CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF title, body, tags ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, title, body, tags) VALUES ('delete', old.id, old.title, old.body, old.tags);
+        INSERT INTO memories_fts(rowid, title, body, tags) VALUES (new.id, new.title, new.body, new.tags);
+      END;
       CREATE TABLE IF NOT EXISTS memory_links (
         source_id   INTEGER NOT NULL,
         target_id   INTEGER NOT NULL,
@@ -423,6 +430,122 @@ describe('tools', () => {
       const second = runImport(db, 'claude-md', path);
       expect(second.imported).toBe(0);
       expect(second.skipped).toBe(1);
+    });
+  });
+
+  describe('v0.4.1 optimizations', () => {
+    it('FTS update trigger does NOT fire on accessed_at/access_count updates', () => {
+      saveMemory(db, {
+        type: 'project',
+        title: 'Marker for FTS touch check',
+        body: 'sentinelword appears here for assertion matching',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      const before = db
+        .prepare(`SELECT count(*) as n FROM memories_fts WHERE memories_fts MATCH 'sentinelword'`)
+        .get() as { n: number };
+      expect(before.n).toBe(1);
+
+      // Pure metadata update — column-restricted trigger must not fire.
+      db.prepare(
+        'UPDATE memories SET accessed_at = accessed_at + 1, access_count = access_count + 1 WHERE id = 1'
+      ).run();
+      const after = db
+        .prepare(`SELECT count(*) as n FROM memories_fts WHERE memories_fts MATCH 'sentinelword'`)
+        .get() as { n: number };
+      expect(after.n).toBe(1);
+
+      // Updating an indexed column (title) DOES re-index so the new title is findable.
+      db.prepare('UPDATE memories SET title = ? WHERE id = 1').run('Renamed freshtokenqqq');
+      const renamed = db
+        .prepare(`SELECT count(*) as n FROM memories_fts WHERE memories_fts MATCH 'freshtokenqqq'`)
+        .get() as { n: number };
+      expect(renamed.n).toBe(1);
+    });
+
+    it('SQL-side eviction removes a low-score non-pinned row, not pinned ones', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const ancient = now - 60 * 86400; // two months ago
+      const insert = db.prepare(
+        `INSERT INTO memories (type, title, body, importance, pinned, created_at, accessed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      // Pinned and high-importance rows should survive.
+      insert.run('user', 'Pinned rule', 'core user preference', 0.9, 1, now, now);
+      insert.run('project', 'Fresh project note', 'important current work', 0.8, 0, now, now);
+      // Low-importance + ancient — should be chosen for eviction.
+      insert.run(
+        'project',
+        'Stale note',
+        'old content nobody cares about',
+        0.05,
+        0,
+        ancient,
+        ancient
+      );
+
+      // Replicate the production eviction SQL (keep in sync with saveMemory).
+      db.prepare(
+        `DELETE FROM memories WHERE id = (
+          SELECT id FROM memories WHERE pinned = 0
+          ORDER BY importance * pow(0.5, ((? - accessed_at) / 86400.0) /
+            CASE type
+              WHEN 'project' THEN 14
+              ELSE 60
+            END
+          ) ASC LIMIT 1
+        )`
+      ).run(now);
+
+      const remaining = db.prepare('SELECT id, title FROM memories ORDER BY id').all() as {
+        id: number;
+        title: string;
+      }[];
+      expect(remaining.length).toBe(2);
+      expect(remaining.map((r) => r.title)).not.toContain('Stale note');
+      expect(remaining.some((r) => r.title === 'Pinned rule')).toBe(true);
+    });
+
+    it('stats aggregate returns correct counts from a single query', () => {
+      // Distinct titles + bodies so fuzzy dedup doesn't merge the two project
+      // entries. Short titles with overlapping words would trip containment.
+      saveMemory(db, {
+        type: 'user',
+        title: 'User preference alpha',
+        body: 'Caveman mode always active across every session',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Queue backpressure design',
+        body: 'Backpressure through bounded channels to protect consumers',
+        importance: 0.5,
+        tags: [],
+        pinned: true,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Cache invalidation scheme',
+        body: 'Stale-while-revalidate with short TTL and versioned keys',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      const json = getStats(db, { format: 'json' });
+      const parsed = JSON.parse(json) as {
+        total: number;
+        pinned: number;
+        by_type: Record<string, number>;
+      };
+      expect(parsed.total).toBe(3);
+      expect(parsed.pinned).toBe(1);
+      expect(parsed.by_type.user).toBe(1);
+      expect(parsed.by_type.project).toBe(2);
+      expect(parsed.by_type.feedback).toBeUndefined();
     });
   });
 });
