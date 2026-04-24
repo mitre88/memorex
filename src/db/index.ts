@@ -19,7 +19,7 @@ export interface OpenOptions {
  * virtual FTS5 table on every boot. Parsing DDL isn't free even when the
  * tables already exist; the version gate makes re-opens O(1).
  */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export function getDb(opts: OpenOptions = {}): Database.Database {
   const dbFile = opts.path ?? PATHS.DB_FILE;
@@ -100,12 +100,16 @@ function applySchema(db: Database.Database): void {
     if (current < 2) migrateV2(db);
     if (current < 3) migrateV3(db);
     if (current < 4) migrateV4(db);
+    if (current < 5) migrateV5(db);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   });
   migrate();
 }
 
 function initV1(db: Database.Database): void {
+  // For fresh DBs skip straight to the v5 form (porter + unicode61 tokenizer).
+  // migrateV5() will be a no-op because the virtual table already has the
+  // desired tokenize option.
   db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +131,8 @@ function initV1(db: Database.Database): void {
       body,
       tags,
       content=memories,
-      content_rowid=id
+      content_rowid=id,
+      tokenize='porter unicode61'
     );
 
     CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -201,5 +206,37 @@ function migrateV4(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_memories_type_title ON memories(type, title);
     CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project) WHERE project IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at) WHERE expires_at IS NOT NULL;
+  `);
+}
+
+function migrateV5(db: Database.Database): void {
+  // v0.5.0: upgrade FTS5 to Porter stemmer on top of unicode61. Makes
+  // "tokens" match "token", "updating" match "update", "decisions" match
+  // "decision" — free recall improvement for queries users actually write.
+  //
+  // FTS5 doesn't support ALTER so we rebuild: drop the virtual table and
+  // its auto-update trigger, recreate both with tokenize='porter unicode61',
+  // then rebuild the index from the base memories table. Safe because FTS
+  // is derived state — no user data lives there.
+  db.exec(`
+    DROP TRIGGER IF EXISTS memories_au;
+    DROP TABLE IF EXISTS memories_fts;
+
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+      title,
+      body,
+      tags,
+      content=memories,
+      content_rowid=id,
+      tokenize='porter unicode61'
+    );
+
+    INSERT INTO memories_fts(rowid, title, body, tags)
+      SELECT id, title, body, tags FROM memories;
+
+    CREATE TRIGGER memories_au AFTER UPDATE OF title, body, tags ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, title, body, tags) VALUES ('delete', old.id, old.title, old.body, old.tags);
+      INSERT INTO memories_fts(rowid, title, body, tags) VALUES (new.id, new.title, new.body, new.tags);
+    END;
   `);
 }

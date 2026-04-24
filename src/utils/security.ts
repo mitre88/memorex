@@ -1,5 +1,4 @@
-import { normalize, resolve } from 'path';
-import { homedir } from 'os';
+import { normalize } from 'path';
 import { LIMITS } from './config.js';
 
 /**
@@ -28,48 +27,36 @@ export function sanitizeFtsQuery(query: string): string {
 }
 
 /**
- * Validates that a project path is safe.
- * Prevents path traversal attacks.
+ * Validates that a project path is well-formed.
+ *
+ * The previous implementation rejected any absolute path outside `$HOME`,
+ * which broke legitimate repos under `/tmp`, `/private/var` (macOS realpath),
+ * `/opt`, system repos, etc. Git-root detection already produces paths the
+ * user trusts, and the search/save paths use parameterized SQL so there is
+ * no SQL-injection vector through this string. We keep the lightweight
+ * safety net (no null bytes, no traversal beyond the starting point,
+ * bounded length) without the home-scope jail.
  */
 export function isValidProjectPath(project: string): boolean {
   if (!project || typeof project !== 'string') {
     return false;
   }
+  if (project.includes('\0')) return false;
+  if (project.length > LIMITS.MAX_PROJECT_PATH_LENGTH) return false;
 
-  // Reject paths with null bytes
-  if (project.includes('\0')) {
-    return false;
-  }
-
-  // Normalize and check for path traversal
+  // Reject `..` sequences that would escape the starting point. We permit
+  // absolute paths on any root (they canonicalize below) and relative paths
+  // as long as they never dip below depth 0.
   const normalized = normalize(project);
-
-  // Reject absolute paths outside home directory
-  if (normalized.startsWith('/') || normalized.startsWith('\\')) {
-    const home = homedir();
-    const resolved = resolve(normalized);
-    if (!resolved.startsWith(home)) {
-      return false;
-    }
-  }
-
-  // Reject parent directory references that escape intended scope
   const parts = normalized.split(/[/\\]/);
   let depth = 0;
   for (const part of parts) {
     if (part === '..') {
       depth--;
-      if (depth < 0) {
-        return false; // Attempts to escape above starting point
-      }
+      if (depth < 0) return false;
     } else if (part && part !== '.') {
       depth++;
     }
-  }
-
-  // Length limit
-  if (project.length > LIMITS.MAX_PROJECT_PATH_LENGTH) {
-    return false;
   }
 
   return true;

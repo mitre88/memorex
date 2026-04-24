@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-23
+
+Sprint 1 from the Utility + Token-Savings plan. Six focused changes, one
+DB migration (v5), measurable token savings on auto-inject, better recall
+on natural-language queries.
+
+### Added
+
+- **T1 — Session-scoped LRU dedup for auto-inject.** Every injection writes
+  its chosen memory IDs to `~/.memorex/inject-lru.json` keyed by session id.
+  The next prompt in the same session skips candidates that were injected
+  in the last ~20 turns (4h TTL). Saves 20–40 % of auto-inject tokens in
+  long sessions where the same memories would otherwise re-appear every turn.
+- **U3 — `tags` filter on `memory_search`.** Pass `tags: ["decision","auth"]`
+  to restrict hits to memories carrying any of those tags. Implemented with
+  SQLite `json_each` for correctness on arbitrary tag arrays.
+- **T3 — Adaptive inject budget.** Token budget now scales with prompt
+  length: short prompts ("continue") get 200 tokens, long prompts get up to
+  the `MEMOREX_INJECT_BUDGET` ceiling. Formula: `clamp(180 + 0.5·chars,
+200, ceiling)`.
+- **T4 — Compact inject wrapper.** XML preamble dropped from 55 chars to
+  19 (`<memorex>`). Per-memory line switched from `#1 P:Title|body` to
+  `1/P Title: body`. Pure token savings, same information.
+
+### Changed
+
+- **P2 — FTS5 now uses the Porter stemmer** (`tokenize='porter unicode61'`).
+  Queries like "update" match memories written about "updating" / "updates"
+  / "updated". Migration v5 drops and rebuilds the FTS index from the base
+  table — safe because FTS is derived state.
+- **U2 — Project hierarchy matching.** A memory whose `project` column is
+  `/repo` now matches queries scoped to `/repo/packages/ui`. Prefix-aware
+  clause: `project = ? OR ? LIKE project || '/%'`. Fixes the longstanding
+  annoyance where saving at repo root hid memories from sub-directory work.
+- **`isValidProjectPath` no longer jails to `$HOME`.** Git repos in `/tmp`,
+  `/private/var` (macOS realpath), system paths, etc. now validate cleanly.
+  Length and traversal protections remain.
+
+### Performance
+
+- `getDbReadonly` open: **0.042 ms/op** (down from 0.097 ms/op in v0.4.1 —
+  measurement run; the open path itself didn't change, this is variance).
+- `saveMemory` triggering SQL eviction: **0.264 ms/op** (from 0.574 ms/op)
+  thanks to new indexes biting in the eviction sort.
+- `getStats` consolidated query: **0.08 ms/op** (from 0.14 ms/op compact).
+
 ## [0.4.1] - 2026-04-23
 
 Pure performance pass. No API changes. No behavior changes other than speed
@@ -184,7 +230,8 @@ and fewer writes per operation.
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.4.1...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/mitre88/memorex/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/mitre88/memorex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mitre88/memorex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mitre88/memorex/compare/v0.1.0...v0.3.0

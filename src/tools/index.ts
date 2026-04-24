@@ -15,11 +15,30 @@ import { logger } from '../utils/logger.js';
 import { getProjectRoot } from '../utils/project.js';
 import { isValidProjectPath, sanitizeFtsQuery, validateTags } from '../utils/security.js';
 
+/**
+ * SQL fragment for "memory belongs to this project OR a parent scope of it".
+ *
+ * A memory with project=`/foo` should match when the caller is in `/foo/bar`,
+ * because saving was shallower than the query. This mirrors how git and most
+ * project tools treat sub-directories. NULL projects always match.
+ *
+ * Requires one positional parameter for the caller's project path. Usage:
+ *   WHERE ${projectHierarchyClause()}
+ *   params.push(project)
+ */
+function projectHierarchyClause(alias = 'm'): string {
+  // `? = alias.project` catches exact match; the LIKE prefix-match handles the
+  // "query is deeper than the saved scope" case. We append '/' before the
+  // wildcard to avoid accidental substring matches ('/foo' matching '/foobar').
+  return `(${alias}.project IS NULL OR ${alias}.project = ? OR ? LIKE ${alias}.project || '/%')`;
+}
+
 export type SearchInputType = z.infer<typeof SearchInput>;
 export const SearchInput = z.object({
   query: z.string().describe('Keywords or question'),
   project: z.string().optional().describe('Project path filter'),
   types: z.array(z.enum(['user', 'project', 'feedback', 'reference'])).optional(),
+  tags: z.array(z.string()).optional().describe('Require any of these tags to match'),
   token_budget: z.number().default(SEARCH_DEFAULTS.TOKEN_BUDGET).describe('Max tokens'),
   min_score: z.number().default(SEARCH_DEFAULTS.MIN_SCORE).describe('Min score 0-1'),
 });
@@ -208,12 +227,12 @@ export function getContext(db: Database.Database, input: ContextInputType): stri
       END as score
       FROM memories m
       WHERE (expires_at IS NULL OR expires_at > ?)
-        AND (pinned = 1 OR project IS NULL OR project = ?)
+        AND (pinned = 1 OR m.project IS NULL OR m.project = ? OR ? LIKE m.project || '/%')
       ORDER BY score DESC
       LIMIT 30
     `
     )
-    .all(now, now, project) as (Memory & { score: number })[];
+    .all(now, now, project, project) as (Memory & { score: number })[];
 
   const results: string[] = [];
   let tokensUsed = 0;
@@ -321,11 +340,17 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     const typeFilter = input.types?.length
       ? `AND m.type IN (${input.types.map(() => '?').join(',')})`
       : '';
-    const projectFilter = input.project ? 'AND (m.project IS NULL OR m.project = ?)' : '';
+    const projectFilter = input.project ? `AND ${projectHierarchyClause('m')}` : '';
+    // Tag filter: match rows whose JSON tags array contains ANY of the
+    // requested tags. Uses SQLite json_each which ships with better-sqlite3.
+    const tagFilter = input.tags?.length
+      ? `AND EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value IN (${input.tags.map(() => '?').join(',')}))`
+      : '';
     const safeQuery = sanitizeFtsQuery(input.query);
     const params: (string | number)[] = [safeQuery];
     if (input.types?.length) params.push(...input.types);
-    if (input.project) params.push(input.project);
+    if (input.project) params.push(input.project, input.project); // used twice in hierarchy clause
+    if (input.tags?.length) params.push(...input.tags);
     params.push(now);
 
     // Title weighted ~10x over body so exact-title matches dominate;
@@ -340,6 +365,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
       WHERE memories_fts MATCH ?
         ${typeFilter}
         ${projectFilter}
+        ${tagFilter}
         AND (m.expires_at IS NULL OR m.expires_at > ?)
       ORDER BY fts_rank
       LIMIT 25

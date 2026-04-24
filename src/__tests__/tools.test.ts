@@ -47,7 +47,7 @@ describe('tools', () => {
         accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
         expires_at INTEGER
       );
-      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(title, body, tags, content=memories, content_rowid=id);
+      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(title, body, tags, content=memories, content_rowid=id, tokenize='porter unicode61');
       CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
         INSERT INTO memories_fts(rowid, title, body, tags) VALUES (new.id, new.title, new.body, new.tags);
       END;
@@ -506,6 +506,84 @@ describe('tools', () => {
       expect(remaining.length).toBe(2);
       expect(remaining.map((r) => r.title)).not.toContain('Stale note');
       expect(remaining.some((r) => r.title === 'Pinned rule')).toBe(true);
+    });
+
+    it('porter stemmer matches morphological variants', () => {
+      // With tokenize='porter unicode61' the FTS index stores stems, so
+      // "updating" / "updated" / "updates" all match "update".
+      saveMemory(db, {
+        type: 'project',
+        title: 'Deployment pipeline notes',
+        body: 'The pipeline is updating frequently after each merge to main.',
+        importance: 0.6,
+        tags: [],
+        pinned: false,
+      });
+      // Query uses the infinitive — pre-0.5 this would miss.
+      const result = searchMemories(db, {
+        query: 'update',
+        token_budget: 500,
+        min_score: 0,
+      });
+      expect(result).toContain('Deployment pipeline notes');
+    });
+
+    it('project hierarchy: memory in /foo matches query for /foo/bar', () => {
+      // Simulate a memory saved from the repo root, then a search from a subdir.
+      db.prepare(
+        `INSERT INTO memories (type, title, body, project) VALUES ('project', 'Repo-wide rule', 'Use tabs for indentation across all packages', '/tmp/repo')`
+      ).run();
+      const result = searchMemories(db, {
+        query: 'indentation tabs',
+        project: '/tmp/repo/packages/ui',
+        token_budget: 500,
+        min_score: 0,
+      });
+      expect(result).toContain('Repo-wide rule');
+    });
+
+    it('project hierarchy: sibling projects do NOT leak into each other', () => {
+      db.prepare(
+        `INSERT INTO memories (type, title, body, project) VALUES ('project', 'Project A rule', 'Specific to alpha repo', '/tmp/alpha')`
+      ).run();
+      db.prepare(
+        `INSERT INTO memories (type, title, body, project) VALUES ('project', 'Project B rule', 'Specific to beta repo', '/tmp/beta')`
+      ).run();
+      const result = searchMemories(db, {
+        query: 'rule repo',
+        project: '/tmp/alpha',
+        token_budget: 500,
+        min_score: 0,
+      });
+      expect(result).toContain('Project A rule');
+      expect(result).not.toContain('Project B rule');
+    });
+
+    it('tag filter: search restricted to requested tags', () => {
+      saveMemory(db, {
+        type: 'project',
+        title: 'Auth decision notes',
+        body: 'JWT with rotating refresh tokens chosen for the auth flow.',
+        importance: 0.6,
+        tags: ['auth', 'decision'],
+        pinned: false,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Caching approach selected',
+        body: 'Redis chosen for the caching layer backing hot reads.',
+        importance: 0.6,
+        tags: ['cache', 'decision'],
+        pinned: false,
+      });
+      const onlyAuth = searchMemories(db, {
+        query: 'decision',
+        tags: ['auth'],
+        token_budget: 500,
+        min_score: 0,
+      });
+      expect(onlyAuth).toContain('Auth decision notes');
+      expect(onlyAuth).not.toContain('Caching approach selected');
     });
 
     it('stats aggregate returns correct counts from a single query', () => {

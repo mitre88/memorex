@@ -2,46 +2,114 @@
 /**
  * UserPromptSubmit hook — auto-inject relevant memories into every prompt.
  *
- * This is the hook that turns memorex from "tool Claude must remember to call"
- * into "passive memory layer always on". On every user prompt:
+ * Turns memorex from "tool Claude must remember to call" into "passive memory
+ * layer always on". On every user prompt:
  *
  *   1. Read the incoming prompt from Claude Code's hook stdin JSON.
- *   2. Run a budget-capped FTS search against memories scoped to this project.
- *   3. Emit top matches on stdout — Claude Code appends them to the prompt as
- *      additional context.
+ *   2. Skip memory IDs already injected in this session's recent history
+ *      (LRU dedup) so we don't pay to re-inject the same context every turn.
+ *   3. Run a budget-capped FTS search against memories scoped to this project
+ *      with an adaptive budget sized to the prompt.
+ *   4. Emit top matches on stdout in a compact wrapper — Claude Code appends
+ *      them to the prompt as additional context.
  *
  * Guarantees:
  *   - Never blocks the user: every failure exits silently with code 0.
  *   - Zero-cost when there are no relevant memories (prints nothing).
  *   - Does NOT refresh accessed_at on matches — auto-injection shouldn't
  *     artificially extend the life of otherwise-cold memories.
- *   - Self-budgeted to ~500 tokens; tunable via MEMOREX_INJECT_BUDGET env.
+ *   - Adaptive token budget: short prompts get smaller budgets, long ones
+ *     get more. Tunable via MEMOREX_INJECT_BUDGET env (caps the ceiling).
  */
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { getDbReadonly } from '../db/index.js';
-import {
-  scoreMemory,
-  estimateTokens,
-  formatMemoryForContext,
-  type Memory,
-} from '../types/scoring.js';
-import { SCORING } from '../utils/config.js';
+import { scoreMemory, estimateTokens, type Memory } from '../types/scoring.js';
+import { PATHS, SCORING } from '../utils/config.js';
 import { getProjectRoot } from '../utils/project.js';
 import { sanitizeFtsQuery } from '../utils/security.js';
 
-const INJECT_TOKEN_BUDGET = Number(process.env.MEMOREX_INJECT_BUDGET ?? '500');
+// ---- Budget tuning --------------------------------------------------------
+
+const INJECT_BUDGET_CEILING = Number(process.env.MEMOREX_INJECT_BUDGET ?? '500');
 const INJECT_MIN_SCORE = Number(process.env.MEMOREX_INJECT_MIN_SCORE ?? '0.15');
 const INJECT_MAX_RESULTS = Number(process.env.MEMOREX_INJECT_MAX ?? '3');
-// Fetch a few more rows than we'll emit so scoring has headroom after
-// min-score filtering. Anything beyond ~4x the cap is wasted I/O.
 const INJECT_FETCH_LIMIT = Math.max(8, INJECT_MAX_RESULTS * 4);
-// Inject preamble must be unambiguous so Claude treats this as memory, not user text.
-const PREAMBLE = '<memorex-context source="memorex" scope="auto-injected">';
-const POSTAMBLE = '</memorex-context>';
+
+/**
+ * Scale the token budget with prompt length. Very short prompts ("continue",
+ * "yes") don't need much context; long detailed prompts benefit from more.
+ * Formula: 180 + 0.5 * chars, clamped to [200, ceiling].
+ */
+function adaptiveBudget(promptLength: number): number {
+  const scaled = Math.round(180 + promptLength * 0.5);
+  return Math.max(200, Math.min(INJECT_BUDGET_CEILING, scaled));
+}
+
+// ---- Session-scoped LRU dedup --------------------------------------------
+
+/** Cap on how many recently-injected IDs we remember per session. */
+const LRU_CAP = 20;
+/** Entries older than this are evicted on read. Matches session TTL. */
+const LRU_TTL_SECONDS = 4 * 3600;
+const LRU_FILE = join(PATHS.DB_DIR, 'inject-lru.json');
+
+interface LruEntry {
+  ids: number[];
+  at: number;
+}
+type LruStore = Record<string, LruEntry>;
+
+function readLru(): LruStore {
+  try {
+    if (!existsSync(LRU_FILE)) return {};
+    const parsed = JSON.parse(readFileSync(LRU_FILE, 'utf8')) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as LruStore;
+    }
+  } catch {
+    /* fall through — treat corrupt cache as empty */
+  }
+  return {};
+}
+
+function writeLru(store: LruStore): void {
+  try {
+    writeFileSync(LRU_FILE, JSON.stringify(store), { mode: 0o600 });
+  } catch {
+    /* best-effort — LRU is optimization, not correctness */
+  }
+}
+
+function gcLru(store: LruStore, now: number): void {
+  for (const [key, entry] of Object.entries(store)) {
+    if (now - entry.at > LRU_TTL_SECONDS) delete store[key];
+  }
+}
+
+// ---- Inject format --------------------------------------------------------
+
+// Compact wrapper. Old wrapper was ~55 chars of XML per injection; this is 19.
+const PREAMBLE = '<memorex>';
+const POSTAMBLE = '</memorex>';
+
+/** Per-memory compact format: `1/P Title: body`. Tighter than the default
+ *  search format (`#1 P:Title|body`) which is used for MCP responses. */
+function formatInjection(m: Memory, maxBody: number): string {
+  let body = m.body;
+  if (body.length > maxBody) {
+    const truncated = body.slice(0, maxBody);
+    const lastSentence = truncated.match(/.*[.!?]\s*/);
+    body = (lastSentence ? lastSentence[0].trim() : truncated) + '…';
+  }
+  const type = m.type[0].toUpperCase();
+  return `${m.id}/${type} ${m.title}: ${body}`;
+}
+
+// ---- Hook plumbing --------------------------------------------------------
 
 function readStdinSync(): string {
   try {
-    // `0` is the stdin file descriptor. readFileSync handles closed pipes cleanly.
     return readFileSync(0, 'utf8');
   } catch {
     return '';
@@ -54,21 +122,24 @@ interface HookPayload {
   hook_event_name?: unknown;
 }
 
-function extractPrompt(raw: string): string {
-  if (!raw) return '';
+function extractPayload(raw: string): { prompt: string; sessionId: string } {
+  if (!raw) return { prompt: '', sessionId: '' };
   try {
     const parsed = JSON.parse(raw) as HookPayload;
-    if (typeof parsed.prompt === 'string') return parsed.prompt;
+    return {
+      prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
+      sessionId: typeof parsed.session_id === 'string' ? parsed.session_id.slice(0, 64) : '',
+    };
   } catch {
-    // Not JSON — some hook harnesses pipe raw text. Use as-is.
-    return raw;
+    // Non-JSON stdin — some harnesses pipe raw text. No session id available.
+    return { prompt: raw, sessionId: '' };
   }
-  return '';
 }
 
 function main(): void {
   const raw = readStdinSync();
-  const prompt = extractPrompt(raw).slice(0, 2000); // cap to avoid FTS DoS
+  const { prompt: promptRaw, sessionId } = extractPayload(raw);
+  const prompt = promptRaw.slice(0, 2000); // cap to avoid FTS DoS
   if (!prompt.trim()) return;
 
   const safe = sanitizeFtsQuery(prompt);
@@ -76,12 +147,15 @@ function main(): void {
 
   const project = getProjectRoot();
   const now = Math.floor(Date.now() / 1000);
+  const budget = adaptiveBudget(prompt.length);
 
-  // Read-only open: no migrations run, no journal_mode writes, no chmod.
-  // When the DB file doesn't exist yet, this returns null — fresh install,
-  // nothing to inject, silent exit.
   const db = getDbReadonly();
   if (!db) return;
+
+  // Load LRU for this session — the "already shown recently" exclusion list.
+  const lruStore = sessionId ? readLru() : {};
+  if (sessionId) gcLru(lruStore, now);
+  const excludedIds = sessionId ? new Set(lruStore[sessionId]?.ids ?? []) : new Set<number>();
 
   try {
     const { title: wt, body: wb, tags: wtags } = SCORING.BM25_WEIGHTS;
@@ -92,19 +166,20 @@ function main(): void {
       FROM memories_fts
       JOIN memories m ON m.id = memories_fts.rowid
       WHERE memories_fts MATCH ?
-        AND (m.project IS NULL OR m.project = ?)
+        AND (m.project IS NULL OR m.project = ? OR ? LIKE m.project || '/%')
         AND (m.expires_at IS NULL OR m.expires_at > ?)
       ORDER BY fts_rank
       LIMIT ?
     `
       )
-      .all(safe, project, now, INJECT_FETCH_LIMIT) as (Memory & {
+      .all(safe, project, project, now, INJECT_FETCH_LIMIT) as (Memory & {
       fts_rank: number;
     })[];
 
     if (rows.length === 0) return;
 
     const scored = rows
+      .filter((r) => !excludedIds.has(r.id))
       .map((r) => ({ mem: r, score: scoreMemory(r, r.fts_rank) }))
       .filter((x) => x.score >= INJECT_MIN_SCORE)
       .sort((a, b) => b.score - a.score)
@@ -113,18 +188,37 @@ function main(): void {
     if (scored.length === 0) return;
 
     const lines: string[] = [];
+    const injectedIds: number[] = [];
     let tokens = 0;
     for (const { mem } of scored) {
-      // Use tighter display cap for injection so we don't hog the budget on one row.
-      const formatted = formatMemoryForContext(mem, 220);
+      const formatted = formatInjection(mem, 220);
       const cost = estimateTokens(formatted);
-      if (tokens + cost > INJECT_TOKEN_BUDGET) break;
+      if (tokens + cost > budget) break;
       lines.push(formatted);
+      injectedIds.push(mem.id);
       tokens += cost;
     }
     if (lines.length === 0) return;
 
     process.stdout.write(`${PREAMBLE}\n${lines.join('\n')}\n${POSTAMBLE}\n`);
+
+    // Record what we injected so the NEXT prompt in this session doesn't
+    // show the same memories again. Write happens after stdout so the user
+    // sees context even if the cache file is unwritable.
+    if (sessionId) {
+      const priorIds = lruStore[sessionId]?.ids ?? [];
+      // Prepend new hits, dedup, cap.
+      const merged: number[] = [];
+      const seen = new Set<number>();
+      for (const id of [...injectedIds, ...priorIds]) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        merged.push(id);
+        if (merged.length >= LRU_CAP) break;
+      }
+      lruStore[sessionId] = { ids: merged, at: now };
+      writeLru(lruStore);
+    }
   } catch {
     // Any DB or SQL error → silent no-op. The user's prompt must never break.
   } finally {
