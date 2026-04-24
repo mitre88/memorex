@@ -29,6 +29,11 @@ export const LIMITS = {
   MAX_TAGS: 20,
   MAX_TAG_LENGTH: 50,
   ACCESS_COOLDOWN_SECONDS: TIME.HOUR, // 1 hour
+  // TTL auto-promotion: if a memory accrues this many accesses within
+  // PROMOTION_WINDOW_DAYS of creation, clear its expires_at (it's clearly
+  // not a one-shot note — demote from "temporary" to "keep around").
+  PROMOTION_MIN_ACCESSES: 5,
+  PROMOTION_WINDOW_DAYS: 7,
 } as const;
 
 /** Scoring and decay parameters */

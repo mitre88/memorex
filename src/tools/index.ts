@@ -33,6 +33,35 @@ function projectHierarchyClause(alias = 'm'): string {
   return `(${alias}.project IS NULL OR ${alias}.project = ? OR ? LIKE ${alias}.project || '/%')`;
 }
 
+/**
+ * Body Jaccard threshold above which a search hit is treated as a near-
+ * duplicate of an already-emitted higher-scoring hit. Absorbed hits are
+ * reported via "+N similar #id" tails on the keeper row instead of
+ * spending full token budget on them.
+ */
+const SEARCH_DEDUP_JACCARD = 0.7;
+
+/** Word-set tokenizer for body-similarity comparisons. Shared with save-time
+ *  fuzzy dedup but kept at a stricter minLen=4 since body comparisons span
+ *  much larger vocabularies than titles. */
+function bodyWordSet(s: string, minLen = 4): Set<string> {
+  return new Set(
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= minLen)
+  );
+}
+
+function jaccardSim(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
 export type SearchInputType = z.infer<typeof SearchInput>;
 export const SearchInput = z.object({
   query: z.string().describe('Keywords or question'),
@@ -255,6 +284,72 @@ export const RelatedInput = z.object({
   min_strength: z.number().min(0).max(1).default(0.1).describe('Minimum link strength'),
 });
 
+export type MergeInputType = z.infer<typeof MergeInput>;
+export const MergeInput = z.object({
+  keep_id: z.number().describe('Memory ID to keep'),
+  merge_id: z.number().describe('Memory ID to fold into keep_id then delete'),
+  separator: z.string().default('\n\n---\n\n').describe('Body separator between the two halves'),
+});
+
+/**
+ * Merge two memories into one. `merge_id`'s body is appended to `keep_id`'s
+ * body (separated by `separator`), tags are unioned, importance is set to the
+ * max of the two, and `merge_id` is deleted. The old body is captured as a
+ * revision on `keep_id` first so the merge is reversible in history.
+ *
+ * Cascade: `merge_id`'s revisions are deleted (FK cascade). `memory_links`
+ * pointing to `merge_id` are also deleted — callers who want to preserve the
+ * graph should reconstruct links via `memory_save` or rely on auto-link on
+ * the next save that mentions the same topic.
+ */
+export function mergeMemories(db: Database.Database, input: MergeInputType): string {
+  if (input.keep_id === input.merge_id) {
+    return 'Error: keep_id and merge_id must differ.';
+  }
+  const keep = db.prepare('SELECT * FROM memories WHERE id = ?').get(input.keep_id) as
+    | Memory
+    | undefined;
+  if (!keep) return `Memory #${input.keep_id} (keep) not found.`;
+  const merge = db.prepare('SELECT * FROM memories WHERE id = ?').get(input.merge_id) as
+    | Memory
+    | undefined;
+  if (!merge) return `Memory #${input.merge_id} (merge) not found.`;
+
+  // Union tags (both are JSON arrays in text form).
+  let mergedTags: string[] = [];
+  try {
+    const a = JSON.parse(keep.tags || '[]') as unknown;
+    const b = JSON.parse(merge.tags || '[]') as unknown;
+    const arr = [
+      ...(Array.isArray(a) ? (a as string[]) : []),
+      ...(Array.isArray(b) ? (b as string[]) : []),
+    ];
+    mergedTags = [...new Set(arr)].filter((t) => typeof t === 'string').slice(0, LIMITS.MAX_TAGS);
+  } catch {
+    mergedTags = [];
+  }
+
+  // Combine bodies; respect MAX_BODY_LENGTH by truncating the tail if needed.
+  let combined = `${keep.body}${input.separator}${merge.body}`;
+  if (combined.length > LIMITS.MAX_BODY_LENGTH) {
+    combined = combined.slice(0, LIMITS.MAX_BODY_LENGTH - 3) + '...';
+  }
+  const nextImportance = Math.max(keep.importance, merge.importance);
+  const now = Math.floor(Date.now() / 1000);
+
+  const tx = db.transaction(() => {
+    recordRevision(db, keep.id, 'merge');
+    db.prepare(
+      'UPDATE memories SET body = ?, tags = ?, importance = ?, accessed_at = ? WHERE id = ?'
+    ).run(combined, JSON.stringify(mergedTags), nextImportance, now, keep.id);
+    // Deletion cascades to memory_links and memory_revisions for merge_id.
+    db.prepare('DELETE FROM memories WHERE id = ?').run(merge.id);
+  });
+  tx();
+
+  return `Merged #${merge.id} ("${merge.title}") into #${keep.id} ("${keep.title}"). Body ${combined.length} chars, ${mergedTags.length} tag(s).`;
+}
+
 export function getRelated(db: Database.Database, input: RelatedInputType): string {
   const source = db.prepare('SELECT id, title FROM memories WHERE id = ?').get(input.id) as
     | { id: number; title: string }
@@ -392,33 +487,80 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     .filter((x) => x.score >= input.min_score)
     .sort((a, b) => b.score - a.score);
 
-  // Pack into token budget
+  // Pack into token budget with near-duplicate suppression. If two results
+  // share ≥ SEARCH_DEDUP_JACCARD body-word overlap with a higher-scoring hit
+  // we already emitted, skip them and attach a "+1 similar #id" tail to the
+  // keeper so the caller can still find the duplicate if they want. Saves
+  // tokens when two memories cover the same topic via different wordings.
   const results: string[] = [];
   const accessedIds: number[] = [];
   let tokensUsed = 0;
 
+  interface KeeperState {
+    words: Set<string>;
+    lineIndex: number;
+    similarIds: number[];
+  }
+  const keepers: KeeperState[] = [];
+
   for (const { mem } of scored) {
+    const memWords = bodyWordSet(mem.body);
+    let suppressed = false;
+    for (const keeper of keepers) {
+      if (jaccardSim(memWords, keeper.words) >= SEARCH_DEDUP_JACCARD) {
+        keeper.similarIds.push(mem.id);
+        suppressed = true;
+        break;
+      }
+    }
+    if (suppressed) continue;
+
     const formatted = formatMemoryForContext(mem, CONFIG.MAX_DISPLAY_BODY);
     const tokens = estimateTokens(formatted);
     if (tokensUsed + tokens > input.token_budget) break;
     results.push(formatted);
+    keepers.push({ words: memWords, lineIndex: results.length - 1, similarIds: [] });
     tokensUsed += tokens;
     accessedIds.push(mem.id);
   }
 
-  // Batch-update accessed_at in a single transaction. Two wins here:
-  //   (1) halves the per-row SQLite fsync cost vs N separate runs.
-  //   (2) because the v0.4.1 FTS update trigger only fires on changes to
-  //       title/body/tags, touching accessed_at no longer re-indexes FTS at
-  //       all — which is the biggest perf win in the whole search path.
+  // Attach "+N similar #ids" tails to each keeper that absorbed duplicates.
+  for (const keeper of keepers) {
+    if (keeper.similarIds.length === 0) continue;
+    const ids = keeper.similarIds.map((id) => `#${id}`).join(',');
+    results[keeper.lineIndex] += ` (+${keeper.similarIds.length} similar: ${ids})`;
+  }
+
+  // Batch-update accessed_at + run TTL auto-promotion in a single transaction.
+  // Wins here:
+  //   (1) halves per-row SQLite fsync cost vs N separate runs.
+  //   (2) v0.4.1 FTS update trigger is column-restricted, so accessed_at
+  //       updates don't reindex FTS at all.
+  //   (3) auto-promotion: a row hit frequently within its creation window
+  //       probably shouldn't expire. We clear expires_at when access_count
+  //       crosses the threshold and the row is still young.
   // Cooldown guard still prevents hot rows from resetting their decay clock.
   if (accessedIds.length > 0) {
     const ACCESS_COOLDOWN = LIMITS.ACCESS_COOLDOWN_SECONDS;
+    const promoWindow = LIMITS.PROMOTION_WINDOW_DAYS * TIME.DAY;
     const updateStmt = db.prepare(
       'UPDATE memories SET accessed_at = ?, access_count = access_count + 1 WHERE id = ? AND accessed_at < ?'
     );
+    // Promotion fires after the access_count increment, so we check >=
+    // PROMOTION_MIN_ACCESSES inclusive. `AND expires_at IS NOT NULL` keeps
+    // us from churning on already-permanent rows.
+    const promoteStmt = db.prepare(
+      `UPDATE memories SET expires_at = NULL
+       WHERE id = ?
+         AND expires_at IS NOT NULL
+         AND access_count >= ?
+         AND created_at > ?`
+    );
     const tx = db.transaction((ids: number[]) => {
-      for (const id of ids) updateStmt.run(now, id, now - ACCESS_COOLDOWN);
+      for (const id of ids) {
+        updateStmt.run(now, id, now - ACCESS_COOLDOWN);
+        promoteStmt.run(id, LIMITS.PROMOTION_MIN_ACCESSES, now - promoWindow);
+      }
     });
     tx(accessedIds);
   }

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-23
+
+Sprint 2 from the Utility + Token-Savings plan. Five focused changes
+covering hook cold-start, search token economy, memory lifecycle, and
+session recovery.
+
+### Added
+
+- **U5 — `memory_merge` MCP tool** (and `memorex merge <keep_id> <merge_id>`
+  CLI command). Concatenates bodies with a separator, unions tags,
+  takes the max importance, captures a `merge` revision on `keep_id`
+  before mutating, then deletes `merge_id`. FK cascade handles links and
+  revisions of the removed row.
+- **U4 — Stop hook now synthesizes a session summary memory.** On session
+  close the hook walks the transcript and stores a 14-day project memory
+  with the last 5 user prompts, files touched, and duration, tagged
+  `session-summary`. Complements the existing PreCompact snapshot so
+  normal session end is also recoverable from the next session.
+- **T2 — Search result dedup.** Hits whose body Jaccard exceeds
+  `SEARCH_DEDUP_JACCARD` (0.7) with an already-emitted higher-scoring
+  keeper are suppressed and reported as a `+N similar #id` tail on the
+  keeper line. Saves tokens when two memories cover the same topic with
+  different wording.
+- **U6 — TTL auto-promotion.** A memory that accrues `PROMOTION_MIN_ACCESSES`
+  (5) hits within `PROMOTION_WINDOW_DAYS` (7) of creation has its
+  `expires_at` cleared automatically in the `searchMemories` batch update.
+  Stops useful memories from expiring out from under the user.
+
+### Performance
+
+- **P1 — hooks are now bundled with esbuild.** Internal modules collapse
+  into a single ESM file per hook; only `better-sqlite3` (native) stays
+  external. Measured cold-start: **~40 ms/hook** down from **~50 ms/hook**
+  before bundling (~20 % saving, ~40-50 ms per session across 4–5 hook
+  invocations). `npm run build` chains `tsc && node scripts/build-hooks.mjs`.
+
+### Benchmark delta vs 0.5.0 on 200-row corpus
+
+Composite win from porter tokenizer, new indexes, and bundled hooks:
+
+- `getDb` cold: **7.8 ms** (was 18.9 ms)
+- `getDb` warm: **0.35 ms/op** (was 0.88 ms/op)
+- `getDbReadonly`: **0.033 ms/op**
+- `searchMemories`: **0.17 ms/op** (was 0.31 ms/op)
+- `getContext`: **0.08 ms/op** (was 0.23 ms/op)
+- `getStats` compact: **0.05 ms/op** (was 0.08 ms/op)
+- `saveMemory` with eviction: **0.18 ms/op** (was 0.26 ms/op)
+
+### Dev
+
+- New dev dep: `esbuild ^0.28`. No change to production dependencies.
+- New `npm run build:tsc` that runs TypeScript only (useful during test
+  authoring when you don't want to re-bundle every time).
+- `src/__tests__/tools.test.ts` adds 4 cases covering search dedup, TTL
+  auto-promotion, merge, and merge-validation. Total: 55 tests.
+
 ## [0.5.0] - 2026-04-23
 
 Sprint 1 from the Utility + Token-Savings plan. Six focused changes, one
@@ -230,7 +286,8 @@ and fewer writes per operation.
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/mitre88/memorex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mitre88/memorex/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/mitre88/memorex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mitre88/memorex/compare/v0.3.0...v0.4.0

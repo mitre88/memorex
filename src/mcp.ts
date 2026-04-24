@@ -18,6 +18,7 @@ import {
   ExportInput,
   RelatedInput,
   HistoryInput,
+  MergeInput,
   type SearchInputType,
   type SaveInputType,
   type PruneInputType,
@@ -28,6 +29,7 @@ import {
   type ExportInputType,
   type RelatedInputType,
   type HistoryInputType,
+  type MergeInputType,
   searchMemories,
   saveMemory,
   pruneMemories,
@@ -38,12 +40,13 @@ import {
   exportMemories,
   getRelated,
   getHistory,
+  mergeMemories,
 } from './tools/index.js';
 
 export async function runMcpServer(): Promise<void> {
   const server = new McpServer({
     name: 'memorex',
-    version: '0.5.0',
+    version: '0.6.0',
   });
 
   const db = getDb();
@@ -145,6 +148,16 @@ export async function runMcpServer(): Promise<void> {
     // eslint-disable-next-line @typescript-eslint/require-await
     async (input: HistoryInputType) => ({
       content: [{ type: 'text', text: getHistory(db, input) }],
+    })
+  );
+
+  server.tool(
+    'memory_merge',
+    'Merge merge_id into keep_id (concat bodies, union tags, max importance, delete merge_id)',
+    MergeInput.shape,
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async (input: MergeInputType) => ({
+      content: [{ type: 'text', text: mergeMemories(db, input) }],
     })
   );
 

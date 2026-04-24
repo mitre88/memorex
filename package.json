@@ -1,13 +1,14 @@
 {
   "name": "memorex",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Passive memory layer for Claude Code — CLI + auto-inject, pre-compact snapshot, subagent capture, knowledge graph, revision history, SQLite FTS5",
   "type": "module",
   "bin": {
     "memorex": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/build-hooks.mjs",
+    "build:tsc": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
@@ -31,6 +32,7 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.13.10",
     "@vitest/coverage-v8": "^3.1.1",
+    "esbuild": "^0.28.0",
     "eslint": "^9.24.0",
     "eslint-config-prettier": "^10.1.1",
     "husky": "^9.1.7",

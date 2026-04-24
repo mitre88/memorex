@@ -12,6 +12,7 @@ import {
   deleteMemory,
   updateMemory,
   getHistory,
+  mergeMemories,
 } from '../tools/index.js';
 import { runImport } from '../importers.js';
 import { writeFileSync, mkdirSync } from 'fs';
@@ -584,6 +585,120 @@ describe('tools', () => {
       });
       expect(onlyAuth).toContain('Auth decision notes');
       expect(onlyAuth).not.toContain('Caching approach selected');
+    });
+
+    it('search dedup collapses near-duplicate bodies with a similarity tail', () => {
+      // Two memories covering the same topic with overlapping vocabulary.
+      saveMemory(db, {
+        type: 'project',
+        title: 'Logging framework choice alpha',
+        body: 'Structured logging using pino chosen for production services across the backend platform.',
+        importance: 0.7,
+        tags: [],
+        pinned: false,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Logging framework choice beta',
+        body: 'Structured logging chosen using pino for backend production services across the platform.',
+        importance: 0.6,
+        tags: [],
+        pinned: false,
+      });
+      const result = searchMemories(db, {
+        query: 'logging pino structured backend',
+        token_budget: 2000,
+        min_score: 0,
+      });
+      // Only the higher-scoring keeper should render as a full entry; the dup
+      // should show up only as a "+1 similar" tail.
+      const lines = result.split('\n').filter((l) => l.includes('Logging framework'));
+      expect(lines.length).toBe(1);
+      expect(result).toMatch(/\+1 similar/);
+    });
+
+    it('TTL auto-promotion clears expires_at after threshold accesses', () => {
+      // Seed a memory with a near-expiry TTL and 4 accesses already. One more
+      // search hit should bump it over PROMOTION_MIN_ACCESSES (5) and clear
+      // expires_at because it's still within the 7-day creation window.
+      const now = Math.floor(Date.now() / 1000);
+      const soon = now + 60 * 60; // expires in 1 hour
+      db.prepare(
+        `INSERT INTO memories (type, title, body, importance, access_count, created_at, accessed_at, expires_at)
+         VALUES ('project', 'Promotable note', 'Frequently reused project fact about the build pipeline', 0.5, 4, ?, ?, ?)`
+      ).run(now - 1000, now - 7200, soon);
+
+      // Trigger a search that hits this row. Query matches body words.
+      // Accessed_at was 2h ago, older than ACCESS_COOLDOWN, so the bump fires.
+      searchMemories(db, {
+        query: 'build pipeline project fact',
+        token_budget: 2000,
+        min_score: 0,
+      });
+      const after = db
+        .prepare('SELECT expires_at, access_count FROM memories WHERE id = 1')
+        .get() as {
+        expires_at: number | null;
+        access_count: number;
+      };
+      expect(after.access_count).toBe(5);
+      expect(after.expires_at).toBeNull();
+    });
+
+    it('memory_merge concatenates bodies, unions tags, deletes merge_id', () => {
+      saveMemory(db, {
+        type: 'project',
+        title: 'Deploy pipeline notes',
+        body: 'Uses GitHub Actions with staging then prod steps.',
+        importance: 0.6,
+        tags: ['ci', 'deploy'],
+        pinned: false,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Deploy pipeline addendum',
+        body: 'Also uses cache restoration for faster builds.',
+        importance: 0.7,
+        tags: ['cache'],
+        pinned: false,
+      });
+      const result = mergeMemories(db, {
+        keep_id: 1,
+        merge_id: 2,
+        separator: '\n---\n',
+      });
+      expect(result).toMatch(/Merged #2/);
+      const kept = db.prepare('SELECT body, tags, importance FROM memories WHERE id = 1').get() as {
+        body: string;
+        tags: string;
+        importance: number;
+      };
+      expect(kept.body).toContain('staging');
+      expect(kept.body).toContain('cache restoration');
+      expect(kept.importance).toBe(0.7);
+      const tags = JSON.parse(kept.tags) as string[];
+      expect(tags).toEqual(expect.arrayContaining(['ci', 'deploy', 'cache']));
+      // merge_id is gone.
+      const gone = db.prepare('SELECT id FROM memories WHERE id = 2').get();
+      expect(gone).toBeUndefined();
+      // Revision captured before merge.
+      const revs = db.prepare('SELECT reason FROM memory_revisions WHERE memory_id = 1').all() as {
+        reason: string;
+      }[];
+      expect(revs.some((r) => r.reason === 'merge')).toBe(true);
+    });
+
+    it('memory_merge rejects same id for keep and merge', () => {
+      saveMemory(db, {
+        type: 'project',
+        title: 'Some note',
+        body: 'Some body text for the note regarding topics of interest.',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      const result = mergeMemories(db, { keep_id: 1, merge_id: 1, separator: '\n' });
+      expect(result).toMatch(/differ/);
     });
 
     it('stats aggregate returns correct counts from a single query', () => {

@@ -28,11 +28,12 @@ import {
   updateMemory,
   pruneMemories,
   getHistory,
+  mergeMemories,
 } from './tools/index.js';
 import type { Memory } from './types/scoring.js';
 import { runImport, type ImportSource } from './importers.js';
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 
 type Parsed = {
   positional: string[];
@@ -77,6 +78,7 @@ function help(): string {
     '  memorex prune [--yes]',
     '  memorex backup [path]',
     '  memorex import --from claude-md|obsidian|engram <path>',
+    '  memorex merge <keep_id> <merge_id>',
     '  memorex version',
     '  memorex help',
     '',
@@ -229,6 +231,20 @@ function cmdBackup(dest?: string): string {
   return `Backup written: ${target}`;
 }
 
+function cmdMerge(positional: string[]): string {
+  const keep = Number(positional[0]);
+  const merge = Number(positional[1]);
+  if (!Number.isFinite(keep) || !Number.isFinite(merge)) {
+    return 'Usage: memorex merge <keep_id> <merge_id>';
+  }
+  const db = getDb();
+  try {
+    return mergeMemories(db, { keep_id: keep, merge_id: merge, separator: '\n\n---\n\n' });
+  } finally {
+    db.close();
+  }
+}
+
 function cmdImport(flags: Record<string, string | boolean>, positional: string[]): string {
   const from = typeof flags.from === 'string' ? flags.from : '';
   const path = positional[0];
@@ -299,6 +315,9 @@ export function runCli(argv: string[]): number {
       break;
     case 'import':
       out = cmdImport(flags, positional);
+      break;
+    case 'merge':
+      out = cmdMerge(positional);
       break;
     default:
       process.stderr.write(`Unknown command: ${cmd}\n\n${help()}\n`);
