@@ -33,7 +33,7 @@ import {
 import type { Memory } from './types/scoring.js';
 import { runImport, type ImportSource } from './importers.js';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 
 type Parsed = {
   positional: string[];

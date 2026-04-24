@@ -119,6 +119,8 @@ export const HistoryInput = z.object({
  * it. Called from any path that mutates body/tags/importance. Best-effort —
  * never breaks the caller's write.
  */
+const MAX_REVISIONS_PER_MEMORY = 10;
+
 function recordRevision(db: Database.Database, id: number, reason: string): void {
   try {
     const prev = db.prepare('SELECT body, tags, importance FROM memories WHERE id = ?').get(id) as
@@ -129,6 +131,14 @@ function recordRevision(db: Database.Database, id: number, reason: string): void
       `INSERT INTO memory_revisions (memory_id, body, tags, importance, reason)
        VALUES (?, ?, ?, ?, ?)`
     ).run(id, prev.body, prev.tags, prev.importance, reason);
+    // Compact: retain only the N most recent revisions so the audit table
+    // doesn't grow without bound on frequently-updated memories.
+    db.prepare(
+      `DELETE FROM memory_revisions WHERE memory_id = ? AND id NOT IN (
+         SELECT id FROM memory_revisions WHERE memory_id = ?
+         ORDER BY revised_at DESC LIMIT ?
+       )`
+    ).run(id, id, MAX_REVISIONS_PER_MEMORY);
   } catch {
     // Revisions are an audit trail; never block the primary write.
   }
@@ -356,29 +366,42 @@ export function getRelated(db: Database.Database, input: RelatedInputType): stri
     | undefined;
   if (!source) return `Memory #${input.id} not found.`;
 
+  const now = Math.floor(Date.now() / 1000);
+  const hl = SCORING.LINK_DECAY_HALFLIFE_DAYS;
+
+  // Decayed strength = base_strength × 0.5^(days_idle / halflife).
+  // Links not traversed for LINK_DECAY_HALFLIFE_DAYS days have half the
+  // effective strength, keeping the graph biased toward active connections.
   const neighbors = db
     .prepare(
       `
-    SELECT m.id, m.type, m.title, l.strength, l.kind
+    SELECT m.id, m.type, m.title, l.kind,
+      ROUND(l.strength * pow(0.5, ((? - COALESCE(l.last_used_at, l.created_at)) / 86400.0) / ?), 3) AS decayed_strength
     FROM memory_links l
     JOIN memories m ON m.id = l.target_id
-    WHERE l.source_id = ? AND l.strength >= ?
-    ORDER BY l.strength DESC
+    WHERE l.source_id = ?
+      AND l.strength * pow(0.5, ((? - COALESCE(l.last_used_at, l.created_at)) / 86400.0) / ?) >= ?
+    ORDER BY decayed_strength DESC
     LIMIT ?
   `
     )
-    .all(input.id, input.min_strength, input.limit) as {
+    .all(now, hl, input.id, now, hl, input.min_strength, input.limit) as {
     id: number;
     type: string;
     title: string;
-    strength: number;
+    decayed_strength: number;
     kind: string;
   }[];
+
+  // Traversal refreshes last_used_at — link stays "alive" if regularly queried.
+  if (neighbors.length > 0) {
+    db.prepare('UPDATE memory_links SET last_used_at = ? WHERE source_id = ?').run(now, input.id);
+  }
 
   if (neighbors.length === 0) return `No neighbors for #${input.id}: "${source.title}".`;
 
   const lines = neighbors.map(
-    (n) => `  #${n.id} [${n.type}] ${n.title} (${n.kind}, ${n.strength.toFixed(2)})`
+    (n) => `  #${n.id} [${n.type}] ${n.title} (${n.kind}, ${n.decayed_strength.toFixed(2)})`
   );
   return `#${input.id} "${source.title}" → ${neighbors.length} neighbor(s):\n${lines.join('\n')}`;
 }
@@ -467,6 +490,48 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     `
       )
       .all(...params) as (Memory & { fts_rank: number })[];
+
+    // U1 — Synonym expansion fallback. When literal FTS returns fewer than 3
+    // hits, re-run with synonym-expanded OR query so vocab mismatches don't
+    // silently return empty results. Expanded results are de-duped by id and
+    // get a 0.7× rank penalty so literal matches still rank above synonyms.
+    if (rows.length < 3) {
+      const synQuery = buildSynonymQuery(input.query);
+      if (synQuery) {
+        const synParams: (string | number)[] = [synQuery];
+        if (input.types?.length) synParams.push(...input.types);
+        if (input.project) synParams.push(input.project, input.project);
+        if (input.tags?.length) synParams.push(...input.tags);
+        synParams.push(now);
+        try {
+          const synRows = db
+            .prepare(
+              `
+            SELECT m.*, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) * 0.7 as fts_rank
+            FROM memories_fts
+            JOIN memories m ON m.id = memories_fts.rowid
+            WHERE memories_fts MATCH ?
+              ${typeFilter}
+              ${projectFilter}
+              ${tagFilter}
+              AND (m.expires_at IS NULL OR m.expires_at > ?)
+            ORDER BY fts_rank
+            LIMIT 15
+          `
+            )
+            .all(...synParams) as (Memory & { fts_rank: number })[];
+          const existingIds = new Set(rows.map((r) => r.id));
+          for (const r of synRows) {
+            if (!existingIds.has(r.id)) {
+              rows.push(r);
+              existingIds.add(r.id);
+            }
+          }
+        } catch {
+          // Synonym expansion is best-effort; original results already collected.
+        }
+      }
+    }
   } catch (error) {
     // FTS failed, fallback to recency (limit 10 to stay within token budget)
     logger.warn('FTS search failed, falling back to recency', { query: input.query, error });
@@ -624,20 +689,31 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
   const totalCount = (db.prepare('SELECT COUNT(*) as n FROM memories').get() as { n: number }).n;
   if (totalCount >= CONFIG.MAX_MEMORIES) {
     const hl = SCORING.HALF_LIFE_DAYS;
+    // Cluster-aware eviction: memories that are the sole representative of
+    // their (project × type) cluster get a 2× score penalty, making them
+    // harder to evict than a low-score member of a larger cluster. This
+    // prevents entire topic clusters from being wiped out one by one.
+    // Expired rows are always preferred regardless of cluster membership.
     const evictStmt = db.prepare(`
       DELETE FROM memories WHERE id = (
-        SELECT id FROM memories WHERE pinned = 0
+        SELECT m.id FROM memories m WHERE m.pinned = 0
         ORDER BY
-          CASE WHEN expires_at IS NOT NULL AND expires_at < ? THEN 0 ELSE 1 END,
-          importance * pow(0.5, ((? - accessed_at) / 86400.0) /
-            CASE type
+          CASE WHEN m.expires_at IS NOT NULL AND m.expires_at < ? THEN 0 ELSE 1 END,
+          importance * pow(0.5, ((? - m.accessed_at) / 86400.0) /
+            CASE m.type
               WHEN 'feedback'  THEN ${hl.feedback}
               WHEN 'user'      THEN ${hl.user}
               WHEN 'project'   THEN ${hl.project}
               WHEN 'reference' THEN ${hl.reference}
               ELSE ${hl.default}
             END
-          ) ASC
+          ) * CASE
+              WHEN (SELECT COUNT(*) FROM memories c
+                    WHERE COALESCE(c.project, '__g') = COALESCE(m.project, '__g')
+                      AND c.type = m.type AND c.id != m.id) > 0
+                THEN 1.0
+              ELSE 2.0
+            END ASC
         LIMIT 1
       )
     `);
@@ -790,6 +866,71 @@ const LINK_STOPWORDS = new Set([
 ]);
 
 /**
+ * Compact synonym dictionary for U1 query expansion. Groups of semantically
+ * related terms clustered by programming domain. Kept small and curated —
+ * broad catch-alls do more harm than good via false positives.
+ *
+ * NOTE: terms must be lowercase alphanumeric only (no hyphens, spaces, or
+ * FTS5 operators) so they compose safely into OR queries.
+ */
+const SYNONYM_GROUPS: readonly string[][] = [
+  ['bug', 'error', 'issue', 'problem', 'fail', 'crash', 'broken', 'fix'],
+  ['auth', 'login', 'signin', 'authentication', 'oauth', 'token', 'credential'],
+  ['user', 'account', 'profile', 'member'],
+  ['performance', 'speed', 'optimize', 'latency', 'slow', 'fast', 'cache'],
+  ['database', 'storage', 'persist', 'store', 'sqlite', 'postgres', 'supabase'],
+  ['deploy', 'release', 'publish', 'ship', 'launch', 'push'],
+  ['config', 'setting', 'option', 'preference', 'configure', 'environment', 'env'],
+  ['api', 'endpoint', 'request', 'route', 'fetch', 'call', 'http', 'rest'],
+  ['test', 'spec', 'coverage', 'unit', 'integration', 'vitest', 'jest'],
+  ['style', 'design', 'layout', 'theme', 'color', 'frontend', 'component', 'view'],
+  ['typescript', 'javascript', 'python', 'swift', 'rust', 'language'],
+  ['dependency', 'package', 'library', 'module', 'import', 'install'],
+  ['server', 'backend', 'service', 'microservice', 'worker', 'function'],
+  ['mobile', 'ios', 'android', 'app', 'application', 'xcode', 'swiftui'],
+  ['hook', 'trigger', 'event', 'callback', 'listener', 'handler'],
+] as const;
+
+/**
+ * Build a synonym-expanded FTS5 OR query from user input. For each query term
+ * that belongs to a synonym group, all siblings are ORed in so the search
+ * surface widens beyond the literal word the user typed.
+ *
+ * Output uses FTS5 parenthesized grouping so it's AND-of-ORgroups:
+ *   "auth problem" → "(auth OR login OR …) (problem OR bug OR …)"
+ *
+ * Returns null when no synonyms were found (expansion adds nothing).
+ */
+function buildSynonymQuery(rawQuery: string): string | null {
+  const words = rawQuery
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !LINK_STOPWORDS.has(w));
+
+  if (words.length === 0) return null;
+
+  let expanded = false;
+  const groups: string[] = [];
+  for (const word of words) {
+    let found: readonly string[] | undefined;
+    for (const g of SYNONYM_GROUPS) {
+      if ((g as readonly string[]).includes(word)) {
+        found = g;
+        break;
+      }
+    }
+    if (found && found.length > 1) {
+      groups.push(`(${[word, ...found.filter((s) => s !== word)].join(' OR ')})`);
+      expanded = true;
+    } else {
+      groups.push(word);
+    }
+  }
+  return expanded ? groups.join(' ') : null;
+}
+
+/**
  * Extract a small set of high-signal keywords suitable for an FTS5 OR query.
  * Strips punctuation, lowercases, filters short and stopword tokens, dedups,
  * and caps at `maxTerms`. Returns an empty string when there's not enough
@@ -852,16 +993,17 @@ function autoLinkMemory(db: Database.Database, newId: number, title: string, bod
     // size — small corpora produce tiny magnitudes that fail any absolute
     // threshold even for true matches. Rank order is the stable signal.
     const POSITION_STRENGTH = [0.9, 0.6, 0.3];
+    const linkNow = Math.floor(Date.now() / 1000);
     const insert = db.prepare(
-      `INSERT OR IGNORE INTO memory_links (source_id, target_id, strength, kind)
-       VALUES (?, ?, ?, 'related')`
+      `INSERT OR IGNORE INTO memory_links (source_id, target_id, strength, kind, last_used_at)
+       VALUES (?, ?, ?, 'related', ?)`
     );
     let created = 0;
     const tx = db.transaction((links: { id: number; rank: number }[]) => {
       links.forEach((link, idx) => {
         const strength = POSITION_STRENGTH[idx] ?? 0.2;
-        insert.run(newId, link.id, strength);
-        insert.run(link.id, newId, strength);
+        insert.run(newId, link.id, strength, linkNow);
+        insert.run(link.id, newId, strength, linkNow);
         created++;
       });
     });

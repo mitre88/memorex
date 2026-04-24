@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-21
+
+Sprint 3 — four quality-of-life improvements to scoring, eviction, the
+knowledge graph, and search recall. No new dependencies; no API changes.
+
+### Added
+
+- **U1 — Synonym query expansion.** When literal FTS returns fewer than 3
+  results, `searchMemories` re-runs with a synonym-expanded OR query (15
+  curated groups: auth/login/signin, bug/error/issue, deploy/release/ship,
+  …). Expanded hits receive a 0.7× rank penalty so literal matches still
+  dominate. Solves the most common vocabulary-mismatch failures without
+  adding an embedding model.
+
+### Changed
+
+- **M1 — Stronger popularity boost.** `scoreMemory` popularity term changed
+  from `log1p(access_count) / 10` → `/ 3`. Triples the lift for frequently
+  accessed memories, keeping well-used notes ahead of equally important but
+  stale ones.
+
+- **M2 — Cluster-aware eviction.** Hard-cap eviction now penalises singleton
+  memories (sole member of their `project × type` cluster) with a 2× score
+  multiplier. Memories with cluster mates are evicted first; only when all
+  remaining candidates are singletons does the weakest singleton go.
+  Prevents entire topic clusters from being wiped out one by one.
+
+- **M3 — Link strength decay.** `memory_links` gains a `last_used_at`
+  column (schema v6, migration safe via `ALTER TABLE ADD COLUMN`). Each
+  traversal of a link via `memory_related` refreshes `last_used_at`. The
+  `getRelated` query computes decayed effective strength:
+  `strength × 0.5^(days_idle / 30)`. Links idle for 30 days show at half
+  strength; links never queried since creation decay from their birth date.
+  Auto-link inserts now seed `last_used_at = now`.
+
+- **M4 — Revisions compaction.** `recordRevision` deletes old revision rows
+  beyond the 10 most recent after each insert. Prevents the audit table from
+  growing unbounded on frequently-updated memories.
+
+### Internal
+
+- `src/__tests__/tools.test.ts` adds 4 cases for M1/M2/M3/M4/U1. Total: 59 tests.
+- `SCORING.LINK_DECAY_HALFLIFE_DAYS = 30` added to config.
+
 ## [0.6.0] - 2026-04-23
 
 Sprint 2 from the Utility + Token-Savings plan. Five focused changes
@@ -286,7 +330,8 @@ and fewer writes per operation.
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.6.0...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/mitre88/memorex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mitre88/memorex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mitre88/memorex/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/mitre88/memorex/compare/v0.4.0...v0.4.1

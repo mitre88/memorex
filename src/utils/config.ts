@@ -73,6 +73,11 @@ export const SCORING = {
   // BM25 in SQLite returns negative floats (typical range -0.x to -20+).
   // Divisor of 5 maps rank −5 → ~1.0, −1 → 0.2.
   FTS_RANK_NORM: 5,
+  // Half-life for memory_links strength decay (days). A link not traversed
+  // via memory_related for this many days sees its effective strength halved.
+  // 30 days keeps the graph fresh without aggressively pruning infrequently-
+  // queried but still valid connections.
+  LINK_DECAY_HALFLIFE_DAYS: 30,
 } as const;
 
 /** Default TTL for memory types in days */

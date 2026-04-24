@@ -69,6 +69,7 @@ describe('tools', () => {
         kind        TEXT NOT NULL DEFAULT 'related'
                       CHECK(kind IN ('related','supersedes','references')),
         created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+        last_used_at INTEGER,
         PRIMARY KEY (source_id, target_id, kind),
         FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
         FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
@@ -699,6 +700,151 @@ describe('tools', () => {
       });
       const result = mergeMemories(db, { keep_id: 1, merge_id: 1, separator: '\n' });
       expect(result).toMatch(/differ/);
+    });
+
+    it('M4 — revisions compaction: keeps only 10 most recent, deletes older', () => {
+      saveMemory(db, {
+        type: 'feedback',
+        title: 'Revision compaction target',
+        body: 'Initial body for the compaction test memory entry.',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      const id = (db.prepare('SELECT id FROM memories LIMIT 1').get() as { id: number }).id;
+      // Force 12 update cycles — each triggers recordRevision → we should only
+      // retain the 10 most recent afterwards.
+      for (let i = 0; i < 12; i++) {
+        updateMemory(db, { id, body: `Updated body iteration ${i} with extra detail.` });
+      }
+      const count = (
+        db.prepare('SELECT COUNT(*) as n FROM memory_revisions WHERE memory_id = ?').get(id) as {
+          n: number;
+        }
+      ).n;
+      expect(count).toBeLessThanOrEqual(10);
+    });
+
+    it('M3 — link decay: getRelated refreshes last_used_at on traversal', () => {
+      // Save two linked memories so autoLinkMemory creates a link pair.
+      saveMemory(db, {
+        type: 'project',
+        title: 'Redis caching strategy documentation',
+        body: 'Redis chosen for hot-read caching; TTL 60s. Invalidate on write via pub/sub.',
+        importance: 0.7,
+        tags: ['cache'],
+        pinned: false,
+      });
+      saveMemory(db, {
+        type: 'project',
+        title: 'Redis eviction policy selection notes',
+        body: 'Using allkeys-lru eviction policy for Redis to handle memory pressure.',
+        importance: 0.6,
+        tags: ['cache'],
+        pinned: false,
+      });
+      // autoLinkMemory creates (1→2) and (2→1) links. Backdate last_used_at
+      // on the (1→2) link to simulate a stale connection.
+      const past = Math.floor(Date.now() / 1000) - 10 * 86400; // 10 days ago
+      db.prepare(
+        'UPDATE memory_links SET last_used_at = ? WHERE source_id = 1 AND target_id = 2'
+      ).run(past);
+
+      const before = db
+        .prepare('SELECT last_used_at FROM memory_links WHERE source_id = 1 AND target_id = 2')
+        .get() as { last_used_at: number };
+      expect(before.last_used_at).toBe(past);
+
+      getRelated(db, { id: 1, limit: 5, min_strength: 0 });
+
+      const after = db
+        .prepare('SELECT last_used_at FROM memory_links WHERE source_id = 1 AND target_id = 2')
+        .get() as { last_used_at: number };
+      // Traversal should have bumped last_used_at to approximately now.
+      expect(after.last_used_at).toBeGreaterThan(past);
+    });
+
+    it('U1 — synonym expansion finds auth memory via login query', () => {
+      // Save a memory that uses "auth" / "authentication" vocabulary.
+      saveMemory(db, {
+        type: 'project',
+        title: 'Auth token refresh strategy',
+        body: 'Authentication tokens refresh via sliding window; expiry 1h with 7d refresh.',
+        importance: 0.7,
+        tags: ['auth'],
+        pinned: false,
+      });
+      // Query using synonym "login" — FTS literal miss, synonym expansion hit.
+      const result = searchMemories(db, {
+        query: 'login',
+        token_budget: 2000,
+        min_score: 0,
+      });
+      expect(result).toContain('Auth token refresh strategy');
+    });
+
+    it('M2 — cluster-aware eviction: singleton memory survives when cluster-mate is lower-scored', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const ancient = now - 120 * 86400; // 4 months ago
+      const insert = db.prepare(
+        `INSERT INTO memories (type, title, body, importance, pinned, project, created_at, accessed_at)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?)`
+      );
+      // Singleton in /proj-a (only member of project+type cluster).
+      insert.run(
+        'user',
+        'Singleton pref',
+        'User language preference TypeScript',
+        0.3,
+        '/proj-a',
+        ancient,
+        ancient
+      );
+      // Two project memories in /proj-b — the lower-scored one is a cluster-mate candidate.
+      insert.run(
+        'project',
+        'Proj B note one',
+        'Main architecture note about design',
+        0.6,
+        '/proj-b',
+        now,
+        now
+      );
+      insert.run(
+        'project',
+        'Proj B note stale',
+        'Old stale note about outdated design',
+        0.05,
+        '/proj-b',
+        ancient,
+        ancient
+      );
+
+      // Fill to cap so next save triggers eviction.
+      for (let i = 4; i <= 200; i++) {
+        db.prepare(
+          `INSERT INTO memories (type, title, body, importance, created_at, accessed_at)
+           VALUES ('reference', 'Filler ${i}', 'filler body content for cap testing purposes', 0.4, ?, ?)`
+        ).run(now - i * 100, now - i * 100);
+      }
+
+      saveMemory(db, {
+        type: 'feedback',
+        title: 'Trigger eviction test',
+        body: 'This save should trigger cluster-aware eviction logic and remove the stale cluster-mate.',
+        importance: 0.8,
+        tags: [],
+        pinned: false,
+      });
+
+      // The stale cluster-mate in /proj-b should be evicted (cluster has 2 members, so it's eligible).
+      const stale = db.prepare("SELECT id FROM memories WHERE title = 'Proj B note stale'").get();
+      // The singleton in /proj-a should still exist (penalized 2x in eviction sort).
+      const singleton = db.prepare("SELECT id FROM memories WHERE title = 'Singleton pref'").get();
+      // At least the singleton should survive.
+      expect(singleton).toBeDefined();
+      // Stale cluster-mate was the lowest-score non-singleton — should be gone.
+      expect(stale).toBeUndefined();
     });
 
     it('stats aggregate returns correct counts from a single query', () => {

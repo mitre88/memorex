@@ -19,7 +19,7 @@ export interface OpenOptions {
  * virtual FTS5 table on every boot. Parsing DDL isn't free even when the
  * tables already exist; the version gate makes re-opens O(1).
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export function getDb(opts: OpenOptions = {}): Database.Database {
   const dbFile = opts.path ?? PATHS.DB_FILE;
@@ -101,6 +101,7 @@ function applySchema(db: Database.Database): void {
     if (current < 3) migrateV3(db);
     if (current < 4) migrateV4(db);
     if (current < 5) migrateV5(db);
+    if (current < 6) migrateV6(db);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   });
   migrate();
@@ -206,6 +207,18 @@ function migrateV4(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_memories_type_title ON memories(type, title);
     CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project) WHERE project IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at) WHERE expires_at IS NOT NULL;
+  `);
+}
+
+function migrateV6(db: Database.Database): void {
+  // v0.7.0: add last_used_at to memory_links for strength decay.
+  // Links not traversed via memory_related for LINK_DECAY_HALFLIFE_DAYS see
+  // their effective strength halve, keeping the graph pruned to genuinely
+  // active connections. Existing links seed last_used_at = created_at so
+  // they start decaying from their creation date.
+  db.exec(`
+    ALTER TABLE memory_links ADD COLUMN last_used_at INTEGER;
+    UPDATE memory_links SET last_used_at = created_at WHERE last_used_at IS NULL;
   `);
 }
 

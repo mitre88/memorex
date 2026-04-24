@@ -41,8 +41,9 @@ export function scoreMemory(m: Memory, ftsRank: number = 0): number {
   // Default norm 5 means a rank of -5 maps to ~1.0 (great), -1 to 0.2, -0.1 to 0.02.
   const relevance = ftsRank < 0 ? Math.min(1, Math.abs(ftsRank) / SCORING.FTS_RANK_NORM) : 0.1;
 
-  // Access popularity boost
-  const popularity = Math.log1p(m.access_count) / 10;
+  // Access popularity boost — /3 gives enough lift to keep frequently-used
+  // memories ahead of stale ones with the same importance.
+  const popularity = Math.log1p(m.access_count) / 3;
 
   return m.importance * recency * (1 + relevance + popularity);
 }

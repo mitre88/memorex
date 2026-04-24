@@ -1,6 +1,6 @@
 {
   "name": "memorex",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Passive memory layer for Claude Code — CLI + auto-inject, pre-compact snapshot, subagent capture, knowledge graph, revision history, SQLite FTS5",
   "type": "module",
   "bin": {
