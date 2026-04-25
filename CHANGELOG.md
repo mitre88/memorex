@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-24
+
+Observability + diagnostics. No new dependencies. One DB migration (v7).
+
+The headline change: memorex now keeps a record of every UserPromptSubmit
+hook invocation in a new `inject_events` table — both successful injects
+and skips. That feeds two new commands:
+
+- **`memorex gain`** — RTK-style analytics. Shows inject rate, tokens
+  injected, top memories shown, hit-ratio estimate, by-day history.
+  `--days N`, `--project P`, `--history`, `--json`. Closes the value loop
+  ("is memorex actually helping me?") that until now was a guess.
+- **`memorex doctor`** — health check. Verifies DB exists, schema version,
+  `PRAGMA integrity_check`, FTS index sync, file permissions, the five
+  required hooks wired in `~/.claude/settings.json` (and that each script
+  exists on disk), capacity headroom, recent inject activity. Returns
+  exit 0 / 1 / 2 by worst level so it's scriptable in CI / install
+  validators. Supports `--json`.
+
+### Added
+
+- `inject_events` table with status enum (`inject`, `skip-empty`,
+  `skip-dedup`, `skip-error`) — schema v7 migration, additive only.
+- `src/analytics.ts` — `getGainSummary`, `getGainHistory`, formatters.
+- `src/doctor.ts` — `runDoctor`, `formatDoctorReport`, `doctorExitCode`.
+- `Stop` hook now also drops `inject_events` older than 60 days so the
+  table stays bounded at ~12 KB/day × 60 days ≈ 700 KB on heavy users.
+- 15 new tests (1 db.v7 schema, 8 analytics aggregations + windows + hit
+  ratio, 6 doctor checks + exit codes). Total: 74 tests.
+
+### Changed
+
+- `UserPromptSubmit` hook (`src/hooks/prompt.ts`) now logs an event on
+  every invocation. The hot read path keeps its readonly handle; a brief
+  writable handle is only opened for the `INSERT` after the inject
+  decision is made. Fail-silent — analytics never blocks the user.
+- CLI version → `0.8.0`. MCP server version → `0.8.0`.
+
 ## [0.7.0] - 2026-04-21
 
 Sprint 3 — four quality-of-life improvements to scoring, eviction, the
@@ -330,7 +368,8 @@ and fewer writes per operation.
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.7.0...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/mitre88/memorex/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mitre88/memorex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mitre88/memorex/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mitre88/memorex/compare/v0.4.1...v0.5.0

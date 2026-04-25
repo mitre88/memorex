@@ -32,6 +32,11 @@ memorex backup                  # copy the db into ~/.memorex/backups
 memorex import --from claude-md ~/.claude/CLAUDE.md
 memorex import --from obsidian  ~/Documents/Obsidian\ Vault
 memorex import --from engram    ~/engram-dump.json
+memorex gain                    # last-7d analytics: inject rate, tokens, top memories
+memorex gain --history          # per-day inject/token trend
+memorex gain --json             # machine-readable summary
+memorex doctor                  # health check (DB, schema, hooks, capacity)
+memorex doctor --json           # scriptable diagnostics; exit 0/1/2 by worst level
 memorex help
 ```
 
@@ -81,6 +86,8 @@ src/
 - **Knowledge graph** — every save auto-links to related memories; `memory_related` traverses neighbors
 - **Git-root aware** — project memories bind to `git rev-parse --show-toplevel`, not the current working dir, so sub-directory work doesn't fragment memory
 - **Anti-bloat guards** — hard cap of 200 memories, 5 saves per session, containment-based fuzzy dedup, auto-prune on session end
+- **Observability** — every prompt is logged to an `inject_events` table (success or skip); `memorex gain` reports inject rate, tokens injected, top memories shown, hit-ratio estimate
+- **Diagnostics** — `memorex doctor` validates DB integrity, schema version, FTS index sync, file permissions, hook wiring, and capacity headroom
 - **4 memory types**: `user`, `project`, `feedback`, `reference`
 
 ## MCP Tools

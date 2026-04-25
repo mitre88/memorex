@@ -19,7 +19,7 @@ export interface OpenOptions {
  * virtual FTS5 table on every boot. Parsing DDL isn't free even when the
  * tables already exist; the version gate makes re-opens O(1).
  */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 export function getDb(opts: OpenOptions = {}): Database.Database {
   const dbFile = opts.path ?? PATHS.DB_FILE;
@@ -102,6 +102,7 @@ function applySchema(db: Database.Database): void {
     if (current < 4) migrateV4(db);
     if (current < 5) migrateV5(db);
     if (current < 6) migrateV6(db);
+    if (current < 7) migrateV7(db);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   });
   migrate();
@@ -219,6 +220,39 @@ function migrateV6(db: Database.Database): void {
   db.exec(`
     ALTER TABLE memory_links ADD COLUMN last_used_at INTEGER;
     UPDATE memory_links SET last_used_at = created_at WHERE last_used_at IS NULL;
+  `);
+}
+
+function migrateV7(db: Database.Database): void {
+  // v0.8.0: append-only inject_events table feeds `memorex gain` analytics.
+  //
+  // Each row records ONE UserPromptSubmit hook invocation. We log both
+  // successes (memories injected) and skips (no match / dedup wiped all
+  // candidates / DB missing) so users can see the full picture: not just
+  // "what got shown" but "how often did we have nothing to show".
+  //
+  // Storage budget: ~120 bytes/row × ~100 prompts/day ≈ 12 KB/day. With
+  // the rolling 60-day window enforced by `pruneInjectEvents()` the table
+  // tops out at ~700 KB even on heavy users. Cheap.
+  //
+  // Why a separate table vs reusing memory_revisions: events are a
+  // higher-write-rate stream with a different access pattern (time-window
+  // aggregation, not per-row lookup). Keeping them separate also means
+  // `gain` analytics can't accidentally collide with revision history.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inject_events (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts           INTEGER NOT NULL DEFAULT (unixepoch()),
+      session_id   TEXT,
+      project      TEXT,
+      memory_ids   TEXT NOT NULL DEFAULT '[]',
+      tokens       INTEGER NOT NULL DEFAULT 0,
+      budget       INTEGER NOT NULL DEFAULT 0,
+      prompt_chars INTEGER NOT NULL DEFAULT 0,
+      status       TEXT NOT NULL DEFAULT 'inject'
+                     CHECK(status IN ('inject','skip-empty','skip-dedup','skip-error'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_inject_events_ts ON inject_events(ts);
   `);
 }
 

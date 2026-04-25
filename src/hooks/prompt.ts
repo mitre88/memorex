@@ -23,11 +23,62 @@
  */
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { getDbReadonly } from '../db/index.js';
+import { getDb, getDbReadonly } from '../db/index.js';
 import { scoreMemory, estimateTokens, type Memory } from '../types/scoring.js';
 import { PATHS, SCORING } from '../utils/config.js';
 import { getProjectRoot } from '../utils/project.js';
 import { sanitizeFtsQuery } from '../utils/security.js';
+
+// ---- Analytics ------------------------------------------------------------
+
+interface InjectEvent {
+  status: 'inject' | 'skip-empty' | 'skip-dedup' | 'skip-error';
+  sessionId: string;
+  project: string;
+  memoryIds: number[];
+  tokens: number;
+  budget: number;
+  promptChars: number;
+}
+
+/**
+ * Persist a single inject event to the `inject_events` table for `memorex gain`.
+ * Best-effort — never blocks the hook. Opens a writable handle briefly because
+ * the readonly handle used for search can't write. Total cost ~1ms warm, which
+ * we eat once per prompt to feed analytics.
+ *
+ * We log both successful injects and skips so `gain` can compute the real
+ * coverage rate ("of N prompts this week, X% had matching context").
+ */
+function logInjectEvent(ev: InjectEvent): void {
+  let writable: ReturnType<typeof getDb> | null = null;
+  try {
+    writable = getDb();
+    writable
+      .prepare(
+        `INSERT INTO inject_events
+           (session_id, project, memory_ids, tokens, budget, prompt_chars, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ev.sessionId || null,
+        ev.project || null,
+        JSON.stringify(ev.memoryIds),
+        ev.tokens,
+        ev.budget,
+        ev.promptChars,
+        ev.status
+      );
+  } catch {
+    /* analytics is best-effort; never break the hook */
+  } finally {
+    try {
+      writable?.close();
+    } catch {
+      /* noop */
+    }
+  }
+}
 
 // ---- Budget tuning --------------------------------------------------------
 
@@ -150,7 +201,10 @@ function main(): void {
   const budget = adaptiveBudget(prompt.length);
 
   const db = getDbReadonly();
-  if (!db) return;
+  if (!db) {
+    // DB missing — can't search OR log. Truly silent fresh-install path.
+    return;
+  }
 
   // Load LRU for this session — the "already shown recently" exclusion list.
   const lruStore = sessionId ? readLru() : {};
@@ -176,7 +230,18 @@ function main(): void {
       fts_rank: number;
     })[];
 
-    if (rows.length === 0) return;
+    if (rows.length === 0) {
+      logInjectEvent({
+        status: 'skip-empty',
+        sessionId,
+        project,
+        memoryIds: [],
+        tokens: 0,
+        budget,
+        promptChars: prompt.length,
+      });
+      return;
+    }
 
     const scored = rows
       .filter((r) => !excludedIds.has(r.id))
@@ -185,7 +250,21 @@ function main(): void {
       .sort((a, b) => b.score - a.score)
       .slice(0, INJECT_MAX_RESULTS);
 
-    if (scored.length === 0) return;
+    if (scored.length === 0) {
+      // Distinguish dedup-killed from min-score-killed: if rows existed but
+      // we excluded everything via LRU, the "next prompt" already saw them.
+      const status = excludedIds.size > 0 ? 'skip-dedup' : 'skip-empty';
+      logInjectEvent({
+        status,
+        sessionId,
+        project,
+        memoryIds: [],
+        tokens: 0,
+        budget,
+        promptChars: prompt.length,
+      });
+      return;
+    }
 
     const lines: string[] = [];
     const injectedIds: number[] = [];
@@ -198,9 +277,30 @@ function main(): void {
       injectedIds.push(mem.id);
       tokens += cost;
     }
-    if (lines.length === 0) return;
+    if (lines.length === 0) {
+      logInjectEvent({
+        status: 'skip-empty',
+        sessionId,
+        project,
+        memoryIds: [],
+        tokens: 0,
+        budget,
+        promptChars: prompt.length,
+      });
+      return;
+    }
 
     process.stdout.write(`${PREAMBLE}\n${lines.join('\n')}\n${POSTAMBLE}\n`);
+
+    logInjectEvent({
+      status: 'inject',
+      sessionId,
+      project,
+      memoryIds: injectedIds,
+      tokens,
+      budget,
+      promptChars: prompt.length,
+    });
 
     // Record what we injected so the NEXT prompt in this session doesn't
     // show the same memories again. Write happens after stdout so the user
@@ -221,6 +321,15 @@ function main(): void {
     }
   } catch {
     // Any DB or SQL error → silent no-op. The user's prompt must never break.
+    logInjectEvent({
+      status: 'skip-error',
+      sessionId,
+      project,
+      memoryIds: [],
+      tokens: 0,
+      budget,
+      promptChars: prompt.length,
+    });
   } finally {
     try {
       db.close();

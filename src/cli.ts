@@ -31,9 +31,16 @@ import {
   mergeMemories,
 } from './tools/index.js';
 import type { Memory } from './types/scoring.js';
-import { runImport, type ImportSource } from './importers.js';
+import { runImport } from './importers.js';
+import {
+  getGainSummary,
+  getGainHistory,
+  formatGainSummary,
+  formatGainHistory,
+} from './analytics.js';
+import { runDoctor, formatDoctorReport, doctorExitCode } from './doctor.js';
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 
 type Parsed = {
   positional: string[];
@@ -79,6 +86,8 @@ function help(): string {
     '  memorex backup [path]',
     '  memorex import --from claude-md|obsidian|engram <path>',
     '  memorex merge <keep_id> <merge_id>',
+    '  memorex gain [--days N] [--project P] [--history] [--json]',
+    '  memorex doctor [--json]',
     '  memorex version',
     '  memorex help',
     '',
@@ -134,7 +143,7 @@ function cmdSearch(query: string, flags: Record<string, string | boolean>): stri
       query,
       token_budget: Number(flags.limit ?? 2000),
       min_score: 0.01,
-    } as Parameters<typeof searchMemories>[1]);
+    });
   } finally {
     db.close();
   }
@@ -245,6 +254,52 @@ function cmdMerge(positional: string[]): string {
   }
 }
 
+function cmdGain(flags: Record<string, string | boolean>): string {
+  const opts = {
+    days: typeof flags.days === 'string' ? Number(flags.days) : undefined,
+    project: typeof flags.project === 'string' ? flags.project : undefined,
+  };
+  const db = getDb();
+  try {
+    if (flags.history) {
+      const rows = getGainHistory(db, opts);
+      return flags.json ? JSON.stringify(rows, null, 2) : formatGainHistory(rows);
+    }
+    const summary = getGainSummary(db, opts);
+    return flags.json ? JSON.stringify(summary, null, 2) : formatGainSummary(summary);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Doctor returns a tuple of [text, exitCode]. Most CLI commands return only
+ * text and rely on the dispatcher's default exit code 0; doctor is special
+ * because it's meant to be scriptable in CI / install validators.
+ */
+function cmdDoctor(flags: Record<string, string | boolean>): { out: string; code: number } {
+  // Open DB if it exists; pass null otherwise so doctor can still report.
+  let db: ReturnType<typeof getDb> | null = null;
+  try {
+    if (existsSync(PATHS.DB_FILE)) db = getDb();
+  } catch {
+    db = null;
+  }
+  try {
+    const report = runDoctor(db);
+    if (flags.json) {
+      return { out: JSON.stringify(report, null, 2), code: doctorExitCode(report) };
+    }
+    return { out: formatDoctorReport(report), code: doctorExitCode(report) };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* noop */
+    }
+  }
+}
+
 function cmdImport(flags: Record<string, string | boolean>, positional: string[]): string {
   const from = typeof flags.from === 'string' ? flags.from : '';
   const path = positional[0];
@@ -254,9 +309,10 @@ function cmdImport(flags: Record<string, string | boolean>, positional: string[]
   if (from !== 'claude-md' && from !== 'obsidian' && from !== 'engram') {
     return `Error: unknown source "${from}". Use claude-md, obsidian, or engram.`;
   }
+  // After the guard above, `from` narrows to ImportSource — no cast needed.
   const db = getDb();
   try {
-    const result = runImport(db, from as ImportSource, path);
+    const result = runImport(db, from, path);
     return `Imported ${result.imported} memor${result.imported === 1 ? 'y' : 'ies'} from ${from} (${result.skipped} skipped).`;
   } catch (err) {
     return `Error: ${(err as Error).message}`;
@@ -319,6 +375,16 @@ export function runCli(argv: string[]): number {
     case 'merge':
       out = cmdMerge(positional);
       break;
+    case 'gain':
+      out = cmdGain(flags);
+      break;
+    case 'doctor': {
+      // Doctor short-circuits the standard dispatch because it owns its
+      // exit code: 0 = clean, 1 = warnings, 2 = failures.
+      const r = cmdDoctor(flags);
+      process.stdout.write(r.out.endsWith('\n') ? r.out : `${r.out}\n`);
+      return r.code;
+    }
     default:
       process.stderr.write(`Unknown command: ${cmd}\n\n${help()}\n`);
       return 1;

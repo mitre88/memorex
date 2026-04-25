@@ -191,6 +191,21 @@ function pruneColdMemories(db: ReturnType<typeof getDb>): void {
   }
 }
 
+/**
+ * v0.8.0: drop inject_events older than the analytics window.
+ * 60 days is enough for `gain --history` 30-day rolling charts plus headroom
+ * for users who only run the CLI once a week. Past that the rows are dead
+ * weight that bloat the DB on heavy users (~12 KB/day at typical volumes).
+ */
+function pruneInjectEvents(db: ReturnType<typeof getDb>): void {
+  const cutoff = Math.floor(Date.now() / 1000) - 60 * TIME.DAY;
+  try {
+    db.prepare('DELETE FROM inject_events WHERE ts < ?').run(cutoff);
+  } catch {
+    /* table may not exist on a partially-migrated DB; silent */
+  }
+}
+
 function main(): void {
   const raw = readStdinSync();
   let payload: HookPayload = {};
@@ -209,6 +224,7 @@ function main(): void {
   try {
     writeSessionSummary(db, payload);
     pruneColdMemories(db);
+    pruneInjectEvents(db);
   } catch {
     /* never block */
   } finally {
