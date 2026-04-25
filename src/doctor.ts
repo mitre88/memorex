@@ -41,7 +41,7 @@ export interface DoctorReport {
 }
 
 /** Schema version this binary was built against — kept in sync with src/db/index.ts. */
-const EXPECTED_SCHEMA = 7;
+const EXPECTED_SCHEMA = 8;
 
 const REQUIRED_HOOKS = [
   { event: 'SessionStart', script: 'dist/hooks/start.js' },

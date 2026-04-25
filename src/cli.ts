@@ -29,6 +29,8 @@ import {
   pruneMemories,
   getHistory,
   mergeMemories,
+  rebuildEmbeddings,
+  embeddingStatus,
 } from './tools/index.js';
 import type { Memory } from './types/scoring.js';
 import { runImport } from './importers.js';
@@ -40,7 +42,7 @@ import {
 } from './analytics.js';
 import { runDoctor, formatDoctorReport, doctorExitCode } from './doctor.js';
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 
 type Parsed = {
   positional: string[];
@@ -88,6 +90,8 @@ function help(): string {
     '  memorex merge <keep_id> <merge_id>',
     '  memorex gain [--days N] [--project P] [--history] [--json]',
     '  memorex doctor [--json]',
+    '  memorex embed-status [--json]',
+    '  memorex embed-rebuild [--all]',
     '  memorex version',
     '  memorex help',
     '',
@@ -277,6 +281,45 @@ function cmdGain(flags: Record<string, string | boolean>): string {
  * text and rely on the dispatcher's default exit code 0; doctor is special
  * because it's meant to be scriptable in CI / install validators.
  */
+function cmdEmbedStatus(flags: Record<string, string | boolean>): string {
+  const db = getDb();
+  try {
+    const s = embeddingStatus(db);
+    if (flags.json) return JSON.stringify(s, null, 2);
+    const pct = s.total > 0 ? ((s.with_embedding / s.total) * 100).toFixed(0) : '0';
+    return [
+      `Embeddings: ${s.with_embedding}/${s.total} (${pct}%)  missing: ${s.without_embedding}`,
+      `Enabled: ${s.enabled ? 'yes' : 'no (set MEMOREX_EMBEDDINGS=1)'}`,
+      `Semantic weight: ${s.semantic_weight}`,
+    ].join('\n');
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdEmbedRebuild(flags: Record<string, string | boolean>): Promise<string> {
+  // Soft reminder if the user hasn't enabled embeddings — the rebuild will
+  // no-op silently otherwise (getEmbedder returns null) and that's confusing.
+  if (process.env.MEMOREX_EMBEDDINGS !== '1') {
+    return (
+      'Error: MEMOREX_EMBEDDINGS=1 not set. Enable embeddings first:\n' +
+      '  export MEMOREX_EMBEDDINGS=1\n' +
+      '  memorex embed-rebuild'
+    );
+  }
+  const db = getDb();
+  try {
+    const onlyMissing = !flags.all;
+    process.stdout.write(`Rebuilding embeddings (${onlyMissing ? 'missing only' : 'all'})…\n`);
+    const t0 = Date.now();
+    const result = await rebuildEmbeddings(db, { onlyMissing });
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    return `Done in ${elapsed}s — ${result.done} embedded, ${result.failed} failed, ${result.skipped} skipped (already had one).`;
+  } finally {
+    db.close();
+  }
+}
+
 function cmdDoctor(flags: Record<string, string | boolean>): { out: string; code: number } {
   // Open DB if it exists; pass null otherwise so doctor can still report.
   let db: ReturnType<typeof getDb> | null = null;
@@ -321,7 +364,7 @@ function cmdImport(flags: Record<string, string | boolean>, positional: string[]
   }
 }
 
-export function runCli(argv: string[]): number {
+export async function runCli(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
   const { positional, flags } = parseArgs(rest);
 
@@ -385,6 +428,12 @@ export function runCli(argv: string[]): number {
       process.stdout.write(r.out.endsWith('\n') ? r.out : `${r.out}\n`);
       return r.code;
     }
+    case 'embed-status':
+      out = cmdEmbedStatus(flags);
+      break;
+    case 'embed-rebuild':
+      out = await cmdEmbedRebuild(flags);
+      break;
     default:
       process.stderr.write(`Unknown command: ${cmd}\n\n${help()}\n`);
       return 1;

@@ -46,7 +46,8 @@ describe('tools', () => {
         pinned INTEGER DEFAULT 0,
         created_at INTEGER NOT NULL DEFAULT (unixepoch()),
         accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        expires_at INTEGER
+        expires_at INTEGER,
+        embedding BLOB
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(title, body, tags, content=memories, content_rowid=id, tokenize='porter unicode61');
       CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -885,6 +886,125 @@ describe('tools', () => {
       expect(parsed.by_type.user).toBe(1);
       expect(parsed.by_type.project).toBe(2);
       expect(parsed.by_type.feedback).toBeUndefined();
+    });
+  });
+
+  describe('hybrid search + embeddings (v0.9.0)', () => {
+    // The full hybrid path is gated on MEMOREX_EMBEDDINGS=1 which we can't
+    // toggle mid-test (it's read at module load). Instead we test the
+    // building blocks: embedAndStoreMemory, rebuildEmbeddings, embeddingStatus
+    // — all of which work via setMockEmbedder regardless of env.
+    it('embeddingStatus reports counts on a fresh db', async () => {
+      const { embeddingStatus } = await import('../tools/index.js');
+      const s = embeddingStatus(db);
+      expect(s.total).toBe(0);
+      expect(s.with_embedding).toBe(0);
+      expect(s.without_embedding).toBe(0);
+    });
+
+    it('embedAndStoreMemory writes a 384-dim BLOB and is detectable', async () => {
+      const { setMockEmbedder } = await import('../embeddings.js');
+      const { embedAndStoreMemory, embeddingStatus } = await import('../tools/index.js');
+
+      // Mock embedder returns a deterministic 384-dim normalized vector.
+      const mock = (text: string): Promise<Float32Array> => {
+        const v = new Float32Array(384);
+        for (let i = 0; i < 384; i++) v[i] = Math.sin(text.length + i);
+        let norm = 0;
+        for (let i = 0; i < 384; i++) norm += v[i] * v[i];
+        norm = Math.sqrt(norm);
+        for (let i = 0; i < 384; i++) v[i] /= norm;
+        return Promise.resolve(v);
+      };
+      setMockEmbedder(mock);
+
+      saveMemory(db, {
+        type: 'project',
+        title: 'JWT cookie rotation',
+        body: 'Switched httpOnly cookies, rotates on every request',
+        importance: 0.6,
+        tags: [],
+        pinned: false,
+      });
+
+      const ok = await embedAndStoreMemory(db, 1);
+      expect(ok).toBe(true);
+
+      const s = embeddingStatus(db);
+      expect(s.with_embedding).toBe(1);
+      expect(s.without_embedding).toBe(0);
+
+      // BLOB column has 384 floats × 4 bytes
+      const row = db.prepare('SELECT length(embedding) AS n FROM memories WHERE id = 1').get() as {
+        n: number;
+      };
+      expect(row.n).toBe(384 * 4);
+
+      setMockEmbedder(null);
+    });
+
+    it('rebuildEmbeddings backfills only NULL rows by default', async () => {
+      const { setMockEmbedder } = await import('../embeddings.js');
+      const { rebuildEmbeddings, embeddingStatus } = await import('../tools/index.js');
+
+      setMockEmbedder((text: string) => {
+        const v = new Float32Array(384);
+        for (let i = 0; i < 384; i++) v[i] = Math.sin(text.length * 0.1 + i * 0.01);
+        let n = 0;
+        for (let i = 0; i < 384; i++) n += v[i] * v[i];
+        n = Math.sqrt(n);
+        for (let i = 0; i < 384; i++) v[i] /= n;
+        return Promise.resolve(v);
+      });
+
+      for (const t of ['Auth refactor', 'Cache invalidation', 'Test runner config']) {
+        saveMemory(db, {
+          type: 'project',
+          title: t,
+          body: t.repeat(2),
+          importance: 0.5,
+          tags: [],
+          pinned: false,
+        });
+      }
+      const before = embeddingStatus(db);
+      expect(before.total).toBe(3);
+      expect(before.with_embedding).toBe(0);
+
+      const result = await rebuildEmbeddings(db);
+      expect(result.done).toBe(3);
+      expect(result.failed).toBe(0);
+
+      const after = embeddingStatus(db);
+      expect(after.with_embedding).toBe(3);
+      expect(after.without_embedding).toBe(0);
+
+      // Second pass on the same corpus is a no-op (default = onlyMissing).
+      const second = await rebuildEmbeddings(db);
+      expect(second.done).toBe(0);
+      expect(second.skipped).toBe(3);
+
+      setMockEmbedder(null);
+    });
+
+    it('rebuildEmbeddings reports failures when embedder returns null', async () => {
+      const { setMockEmbedder } = await import('../embeddings.js');
+      const { rebuildEmbeddings } = await import('../tools/index.js');
+
+      // Force null returns by NOT setting a mock and leaving env unset.
+      setMockEmbedder(null);
+
+      saveMemory(db, {
+        type: 'user',
+        title: 'a',
+        body: 'a',
+        importance: 0.5,
+        tags: [],
+        pinned: false,
+      });
+      const r = await rebuildEmbeddings(db);
+      expect(r.done).toBe(0);
+      expect(r.failed).toBe(1);
     });
   });
 });

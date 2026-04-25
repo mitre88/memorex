@@ -37,6 +37,8 @@ memorex gain --history          # per-day inject/token trend
 memorex gain --json             # machine-readable summary
 memorex doctor                  # health check (DB, schema, hooks, capacity)
 memorex doctor --json           # scriptable diagnostics; exit 0/1/2 by worst level
+memorex embed-status            # how many memories have a semantic embedding
+memorex embed-rebuild           # backfill missing embeddings (needs MEMOREX_EMBEDDINGS=1)
 memorex help
 ```
 
@@ -88,6 +90,7 @@ src/
 - **Anti-bloat guards** — hard cap of 200 memories, 5 saves per session, containment-based fuzzy dedup, auto-prune on session end
 - **Observability** — every prompt is logged to an `inject_events` table (success or skip); `memorex gain` reports inject rate, tokens injected, top memories shown, hit-ratio estimate
 - **Diagnostics** — `memorex doctor` validates DB integrity, schema version, FTS index sync, file permissions, hook wiring, and capacity headroom
+- **Hybrid semantic search** *(opt-in)* — set `MEMOREX_EMBEDDINGS=1` and run `memorex embed-rebuild`. Search reranks the top FTS hits with cosine similarity against a local 384-dim sentence embedding (`all-MiniLM-L6-v2`). Catches paraphrases and non-English queries that BM25 misses. ~22 MB one-time model download, no API calls.
 - **4 memory types**: `user`, `project`, `feedback`, `reference`
 
 ## MCP Tools

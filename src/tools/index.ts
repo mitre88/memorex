@@ -9,11 +9,20 @@ import {
   SEARCH_DEFAULTS,
   PRUNE_DEFAULTS,
   TIME,
+  SEMANTIC_WEIGHT,
 } from '../utils/config.js';
 import { canSave, recordSave, sessionStats } from '../utils/session.js';
 import { logger } from '../utils/logger.js';
 import { getProjectRoot } from '../utils/project.js';
 import { isValidProjectPath, sanitizeFtsQuery, validateTags } from '../utils/security.js';
+import {
+  EMBEDDINGS_ENABLED,
+  embedMemory,
+  bufferToVec,
+  cosineSim,
+  vecToBuffer,
+  getEmbedder,
+} from '../embeddings.js';
 
 /**
  * SQL fragment for "memory belongs to this project OR a parent scope of it".
@@ -1115,4 +1124,196 @@ export function getStats(db: Database.Database, input: z.infer<typeof StatsInput
   const oldestStr = agg.oldest ? new Date(agg.oldest * 1000).toISOString().split('T')[0] : 'N/A';
 
   return `M:${agg.total}/${CONFIG.MAX_MEMORIES} ${typeSummary} pin:${pinnedCount} ${oldestStr} S:${sess.saves}/${CONFIG.MAX_SAVES_PER_SESSION}`;
+}
+
+// ===========================================================================
+// Hybrid semantic search (v0.9.0)
+// ===========================================================================
+
+/**
+ * Hybrid search: run the existing FTS+synonym pipeline, then re-rank the
+ * top-N hits by combining BM25 with cosine similarity against a query
+ * embedding. Falls back cleanly to FTS-only when embeddings are disabled
+ * or unavailable.
+ *
+ * Why we re-rank rather than vector-search the whole corpus: BM25 already
+ * handles exact-keyword precision well — the rerank is about catching
+ * paraphrase / cross-language hits that BM25 alone misses among the top
+ * candidates. We cap the rerank window at HYBRID_RERANK_LIMIT to keep
+ * per-query work bounded.
+ *
+ * Score blend: `final = (1 - α) × fts_norm + α × cosine`, α=SEMANTIC_WEIGHT.
+ * cosine is normalized to [0, 1] in `embeddings.ts::cosineSim`.
+ */
+const HYBRID_RERANK_LIMIT = 25;
+
+export async function searchMemoriesHybrid(
+  db: Database.Database,
+  input: z.infer<typeof SearchInput>
+): Promise<string> {
+  // Always run the regular pipeline first — it owns project filter, tag
+  // filter, type filter, FTS sanitization, synonym expansion, dedup, and
+  // the access_at batch update. We just want a chance to reorder.
+  const ftsOutput = searchMemories(db, input);
+
+  // Skip rerank when embeddings are off OR when FTS returned no hits.
+  if (!EMBEDDINGS_ENABLED) return ftsOutput;
+  if (ftsOutput.startsWith('No relevant') || ftsOutput.startsWith('Error')) return ftsOutput;
+
+  const embedder = await getEmbedder();
+  if (!embedder) return ftsOutput;
+
+  // Re-run the FTS query just to grab ids+embeddings (cheap — we have the
+  // embedding column inline on memories). Keep the same filters as the
+  // original search so we never surface a row the original would have hidden.
+  const now = Math.floor(Date.now() / 1000);
+  const safeQuery = sanitizeFtsQuery(input.query);
+  const typeFilter = input.types?.length
+    ? `AND m.type IN (${input.types.map(() => '?').join(',')})`
+    : '';
+  const projectFilter = input.project ? `AND ${projectHierarchyClause('m')}` : '';
+  const tagFilter = input.tags?.length
+    ? `AND EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value IN (${input.tags.map(() => '?').join(',')}))`
+    : '';
+  const params: (string | number)[] = [safeQuery];
+  if (input.types?.length) params.push(...input.types);
+  if (input.project) params.push(input.project, input.project);
+  if (input.tags?.length) params.push(...input.tags);
+  params.push(now);
+
+  type Row = Memory & { fts_rank: number; embedding: Buffer | null };
+  let candidates: Row[];
+  try {
+    const { title: wt, body: wb, tags: wtags } = SCORING.BM25_WEIGHTS;
+    candidates = db
+      .prepare(
+        `SELECT m.*, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) AS fts_rank
+         FROM memories_fts
+         JOIN memories m ON m.id = memories_fts.rowid
+         WHERE memories_fts MATCH ?
+           ${typeFilter}
+           ${projectFilter}
+           ${tagFilter}
+           AND (m.expires_at IS NULL OR m.expires_at > ?)
+         ORDER BY fts_rank
+         LIMIT ${HYBRID_RERANK_LIMIT}`
+      )
+      .all(...params) as Row[];
+  } catch {
+    return ftsOutput; // fall back if anything goes sideways
+  }
+
+  // Drop candidates without an embedding — we can't rerank them, but they
+  // still came back from the FTS pipeline above so the user got them via
+  // pure-FTS scoring. Nothing lost.
+  const reranking = candidates
+    .map((r) => ({ row: r, vec: bufferToVec(r.embedding) }))
+    .filter((x): x is { row: Row; vec: Float32Array } => x.vec !== null);
+  if (reranking.length === 0) return ftsOutput;
+
+  let queryVec: Float32Array;
+  try {
+    queryVec = await embedder(input.query.slice(0, 2000));
+  } catch {
+    return ftsOutput;
+  }
+
+  // Normalize FTS rank into [0, 1] using the same divisor as scoreMemory.
+  const ftsNorm = (rank: number): number =>
+    rank < 0 ? Math.min(1, Math.abs(rank) / SCORING.FTS_RANK_NORM) : 0.1;
+
+  const blended = reranking
+    .map(({ row, vec }) => ({
+      row,
+      score: (1 - SEMANTIC_WEIGHT) * ftsNorm(row.fts_rank) + SEMANTIC_WEIGHT * cosineSim(queryVec, vec),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  // Pack into the same token budget as the FTS path so the contract stays
+  // identical from the caller's perspective.
+  const lines: string[] = [];
+  let tokensUsed = 0;
+  for (const { row } of blended) {
+    const formatted = formatMemoryForContext(row, CONFIG.MAX_DISPLAY_BODY);
+    const tokens = estimateTokens(formatted);
+    if (tokensUsed + tokens > input.token_budget) break;
+    lines.push(formatted);
+    tokensUsed += tokens;
+  }
+  if (lines.length === 0) return ftsOutput;
+  return `${lines.length}|${tokensUsed}tk (hybrid):\n${lines.join('\n|\n')}`;
+}
+
+/**
+ * Compute and store the embedding for a single memory by id. Returns true
+ * on success, false if embeddings disabled / model load failed / row missing.
+ * Used by `embed-rebuild` and by the MCP memory_save fire-and-forget path.
+ */
+export async function embedAndStoreMemory(
+  db: Database.Database,
+  id: number
+): Promise<boolean> {
+  const row = db.prepare('SELECT title, body FROM memories WHERE id = ?').get(id) as
+    | { title: string; body: string }
+    | undefined;
+  if (!row) return false;
+  const vec = await embedMemory(row.title, row.body);
+  if (!vec) return false;
+  try {
+    // Direct UPDATE bypasses the FTS trigger because it's column-restricted
+    // to title/body/tags — embedding writes do NOT cause a reindex.
+    db.prepare('UPDATE memories SET embedding = ? WHERE id = ?').run(vecToBuffer(vec), id);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Backfill embeddings for every memory missing one. Returns counts.
+ * Pinned memories go first so the most-trusted ones become semantically
+ * searchable soonest; everything else processed in id order.
+ */
+export async function rebuildEmbeddings(
+  db: Database.Database,
+  opts: { onlyMissing?: boolean } = {}
+): Promise<{ done: number; skipped: number; failed: number }> {
+  const where = opts.onlyMissing === false ? '' : 'WHERE embedding IS NULL';
+  const ids = db
+    .prepare(`SELECT id FROM memories ${where} ORDER BY pinned DESC, id ASC`)
+    .all() as { id: number }[];
+  let done = 0;
+  let failed = 0;
+  for (const { id } of ids) {
+    const ok = await embedAndStoreMemory(db, id);
+    if (ok) done++;
+    else failed++;
+  }
+  // skipped = total existing - candidates
+  const skipped = (db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n - ids.length;
+  return { done, skipped, failed };
+}
+
+export interface EmbeddingStatus {
+  total: number;
+  with_embedding: number;
+  without_embedding: number;
+  enabled: boolean;
+  semantic_weight: number;
+}
+
+export function embeddingStatus(db: Database.Database): EmbeddingStatus {
+  const total = (db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n;
+  const withE = (
+    db.prepare('SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL').get() as {
+      n: number;
+    }
+  ).n;
+  return {
+    total,
+    with_embedding: withE,
+    without_embedding: total - withE,
+    enabled: EMBEDDINGS_ENABLED,
+    semantic_weight: SEMANTIC_WEIGHT,
+  };
 }

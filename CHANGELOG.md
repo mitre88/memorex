@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-24
+
+Hybrid semantic search via local sentence embeddings. Opt-in (set
+`MEMOREX_EMBEDDINGS=1`); zero behavior change for users who don't.
+
+The headline change: when enabled, `memory_search` now reranks the top-25
+FTS hits using cosine similarity against a 384-dim embedding of the query.
+The model is `all-MiniLM-L6-v2` running locally via `@xenova/transformers`
+(ONNX, ~22 MB on first download, cached after that). No API calls, no
+network on subsequent runs.
+
+This is the substantial recall fix for what BM25 + synonyms couldn't reach:
+non-English queries (Spanish, French, Portuguese, etc.), paraphrase ("auth
+thing" vs "JWT middleware"), and cross-vocabulary matches between save
+language and query language.
+
+### Added
+
+- `src/embeddings.ts` — `getEmbedder`, `embedMemory`, `cosineSim`,
+  `vecToBuffer` / `bufferToVec` for SQLite BLOB ↔ `Float32Array`,
+  `setMockEmbedder` for tests. Lazy import of `@xenova/transformers` so the
+  hot path of every other CLI command pays nothing.
+- `searchMemoriesHybrid` (async) — runs the existing FTS+synonym pipeline,
+  then reranks via embedding cosine. Output is identical in shape to plain
+  `searchMemories` — just better-ordered. Falls back cleanly when
+  embeddings are disabled or unavailable.
+- MCP tool `memory_search` now uses the hybrid path.
+- MCP tool `memory_save` fires off an embedding compute via setImmediate
+  after the synchronous save completes, so embeddings stay fresh without
+  blocking the user's confirmation.
+- CLI `memorex embed-rebuild [--all]` — backfill embeddings for memories
+  that don't have one (or, with `--all`, recompute every memory).
+- CLI `memorex embed-status [--json]` — count of memories with vs without
+  an embedding, current `MEMOREX_SEMANTIC_WEIGHT`.
+- `MEMOREX_SEMANTIC_WEIGHT` env (default `0.4`) controls the FTS-vs-cosine
+  blend: `final = (1 - α) × fts_norm + α × cosine`. 0.4 keeps exact-keyword
+  hits as the primary signal; raise to lean harder on semantic match.
+- New schema migration **v8**: `ALTER TABLE memories ADD COLUMN embedding
+  BLOB` plus a partial index on rows that have one. 1.5 KB/row × 200-cap =
+  300 KB total — trivial.
+- 15 new tests (10 embeddings primitives via mock embedder, 1 db.v8
+  migration, 4 hybrid/rebuild). Total: **89 tests**.
+
+### Changed
+
+- `package.json`: `@xenova/transformers ^2.17.2` listed as
+  `optionalDependencies`. Install succeeds either way; users who skip the
+  optional dep get the same FTS-only behavior they have today.
+- CLI dispatcher (`runCli`) is now `async` so `embed-rebuild` can `await`
+  the embedder. No-op for every other command.
+- Doctor's `EXPECTED_SCHEMA` bumped to 8.
+- MCP server version → `0.9.0`. CLI version → `0.9.0`.
+
+### Performance
+
+- Embedding inference: ~5–15 ms per call on Apple Silicon after model
+  warmup. Model warmup itself is ~300 ms one-time per process.
+- Search rerank window capped at 25 candidates so per-query embedding work
+  is one query embedding + 25 cosine ops over 384-dim vectors. Negligible.
+- Save path doesn't block on embeddings — the new memory id is returned
+  immediately and the embedding fills in within a few hundred ms in the
+  background.
+
 ## [0.8.0] - 2026-04-24
 
 Observability + diagnostics. No new dependencies. One DB migration (v7).
@@ -368,7 +431,8 @@ and fewer writes per operation.
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.8.0...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/mitre88/memorex/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mitre88/memorex/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mitre88/memorex/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mitre88/memorex/compare/v0.5.0...v0.6.0

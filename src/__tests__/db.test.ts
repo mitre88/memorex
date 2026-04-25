@@ -122,4 +122,25 @@ describe('db initialization', () => {
     ).toThrow();
     db.close();
   });
+
+  it('migration v8 adds embedding column and partial index to memories', () => {
+    const db = getDb({ path: dbPath });
+    const v = db.pragma('user_version', { simple: true }) as number;
+    expect(v).toBeGreaterThanOrEqual(8);
+
+    const cols = db.pragma('table_info(memories)') as { name: string; type: string }[];
+    const emb = cols.find((c) => c.name === 'embedding');
+    expect(emb).toBeDefined();
+    expect(emb!.type).toBe('BLOB');
+
+    // Partial index exists
+    const idx = db
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_embedding'`
+      )
+      .get() as { sql: string } | undefined;
+    expect(idx).toBeDefined();
+    expect(idx!.sql).toMatch(/WHERE\s+embedding\s+IS\s+NOT\s+NULL/i);
+    db.close();
+  });
 });

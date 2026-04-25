@@ -19,7 +19,7 @@ export interface OpenOptions {
  * virtual FTS5 table on every boot. Parsing DDL isn't free even when the
  * tables already exist; the version gate makes re-opens O(1).
  */
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 export function getDb(opts: OpenOptions = {}): Database.Database {
   const dbFile = opts.path ?? PATHS.DB_FILE;
@@ -103,6 +103,7 @@ function applySchema(db: Database.Database): void {
     if (current < 5) migrateV5(db);
     if (current < 6) migrateV6(db);
     if (current < 7) migrateV7(db);
+    if (current < 8) migrateV8(db);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   });
   migrate();
@@ -253,6 +254,31 @@ function migrateV7(db: Database.Database): void {
                      CHECK(status IN ('inject','skip-empty','skip-dedup','skip-error'))
     );
     CREATE INDEX IF NOT EXISTS idx_inject_events_ts ON inject_events(ts);
+  `);
+}
+
+function migrateV8(db: Database.Database): void {
+  // v0.9.0: add 384-dim sentence embeddings for hybrid semantic search.
+  //
+  // BLOB column stores Float32Array as raw bytes (1.5 KB/row). At the 200-
+  // memory cap that's 300 KB — trivial. Computed lazily: rows can have NULL
+  // embeddings until either (a) a save with MEMOREX_EMBEDDINGS=1 fills them
+  // in or (b) `memorex embed-rebuild` backfills the corpus.
+  //
+  // Why ALTER TABLE instead of a separate `memory_embeddings` table:
+  //   1. Row-aligned with memories — JOIN-free reads on the search hot path.
+  //   2. ON DELETE behavior is automatic (column lives in the same row).
+  //   3. The FTS update trigger (memories_au) is column-restricted to
+  //      title/body/tags so updating the embedding does NOT trigger a
+  //      reindex (verified in db.test.ts).
+  //
+  // We also add a partial index on rows that already have an embedding so
+  // `memorex embed-status` and the rebuild loop run in O(rows-needing-work)
+  // instead of O(total).
+  db.exec(`
+    ALTER TABLE memories ADD COLUMN embedding BLOB;
+    CREATE INDEX IF NOT EXISTS idx_memories_embedding
+      ON memories(id) WHERE embedding IS NOT NULL;
   `);
 }
 

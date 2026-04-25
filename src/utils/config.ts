@@ -110,6 +110,11 @@ export const PRUNE_DEFAULTS = {
   COLD_MEMORY_THRESHOLD: 0.05,
 } as const;
 
+/** Hybrid search: weight on the embedding cosine vs FTS rank.
+ *  final = (1 - SEMANTIC_WEIGHT) × fts_norm + SEMANTIC_WEIGHT × cosine
+ *  Default 0.4 keeps exact-keyword hits as the primary signal. */
+export const SEMANTIC_WEIGHT = Number(process.env.MEMOREX_SEMANTIC_WEIGHT ?? '0.4');
+
 /** Main config object (backward compatible) */
 export const CONFIG = {
   MAX_MEMORIES: LIMITS.MAX_MEMORIES,

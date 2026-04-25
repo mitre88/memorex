@@ -17,7 +17,7 @@ async function main(): Promise<void> {
     await runMcpServer();
     return;
   }
-  const code = runCli(argv);
+  const code = await runCli(argv);
   process.exit(code);
 }
 

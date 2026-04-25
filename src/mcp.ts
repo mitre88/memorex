@@ -30,8 +30,9 @@ import {
   type RelatedInputType,
   type HistoryInputType,
   type MergeInputType,
-  searchMemories,
+  searchMemoriesHybrid,
   saveMemory,
+  embedAndStoreMemory,
   pruneMemories,
   getStats,
   updateMemory,
@@ -42,11 +43,12 @@ import {
   getHistory,
   mergeMemories,
 } from './tools/index.js';
+import { EMBEDDINGS_ENABLED } from './embeddings.js';
 
 export async function runMcpServer(): Promise<void> {
   const server = new McpServer({
     name: 'memorex',
-    version: '0.8.0',
+    version: '0.9.0',
   });
 
   const db = getDb();
@@ -55,9 +57,10 @@ export async function runMcpServer(): Promise<void> {
     'memory_search',
     'Find relevant memories within token budget',
     SearchInput.shape,
-    // eslint-disable-next-line @typescript-eslint/require-await
     async (input: SearchInputType) => ({
-      content: [{ type: 'text', text: searchMemories(db, input) }],
+      // Hybrid path falls back to plain FTS internally when embeddings are
+      // disabled or unavailable, so it's safe to always go through it.
+      content: [{ type: 'text', text: await searchMemoriesHybrid(db, input) }],
     })
   );
 
@@ -66,9 +69,23 @@ export async function runMcpServer(): Promise<void> {
     'Save or update a memory (deduped)',
     SaveInput.shape,
     // eslint-disable-next-line @typescript-eslint/require-await
-    async (input: SaveInputType) => ({
-      content: [{ type: 'text', text: saveMemory(db, input) }],
-    })
+    async (input: SaveInputType) => {
+      const text = saveMemory(db, input);
+      // Fire-and-forget embedding compute. We pull the new id out of the
+      // success message ("Saved memory #42…"). No await — the user gets the
+      // save confirmation immediately, the embedding fills in within a few
+      // hundred ms in the background.
+      if (EMBEDDINGS_ENABLED) {
+        const m = text.match(/#(\d+)/);
+        if (m) {
+          const id = Number(m[1]);
+          void embedAndStoreMemory(db, id).catch(() => {
+            /* analytics-style: never break the user's save */
+          });
+        }
+      }
+      return { content: [{ type: 'text', text }] };
+    }
   );
 
   server.tool(
