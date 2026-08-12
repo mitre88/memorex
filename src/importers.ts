@@ -3,7 +3,8 @@
  *
  * All importers bypass the session save rate limit (this is a one-shot user
  * action, not Claude writing memories) but still respect the hard 200-memory
- * cap via eviction in saveMemory(). Each importer returns {imported, skipped}.
+ * cap via evictOneIfAtCap() before each new insert. Each importer returns
+ * {imported, skipped}.
  *
  * Sources:
  *   - claude-md   CLAUDE.md-style project instructions (one memory per H2 section)
@@ -13,6 +14,7 @@
 import Database from 'better-sqlite3';
 import { readFileSync, readdirSync, statSync } from 'fs';
 import { join, basename, relative } from 'path';
+import { evictOneIfAtCap } from './db/evict.js';
 
 export type ImportSource = 'claude-md' | 'obsidian' | 'engram';
 
@@ -45,6 +47,7 @@ function insertRaw(db: Database.Database, mem: RawMemory): boolean {
     );
     return false;
   }
+  evictOneIfAtCap(db, now);
   db.prepare(
     `INSERT INTO memories (type, title, body, project, tags, importance, pinned, created_at, accessed_at)
      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`

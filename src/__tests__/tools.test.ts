@@ -434,6 +434,36 @@ describe('tools', () => {
       expect(second.imported).toBe(0);
       expect(second.skipped).toBe(1);
     });
+
+    it('enforces the 200-memory cap on import instead of growing past it', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const insert = db.prepare(
+        `INSERT INTO memories (type, title, body, importance, created_at, accessed_at)
+         VALUES ('reference', ?, 'filler body for cap testing purposes here', 0.1, ?, ?)`
+      );
+      for (let i = 0; i < 200; i++) {
+        insert.run(`Filler ${i}`, now - 86400, now - 86400);
+      }
+      const path = join(tempDir, 'overcap.json');
+      writeFileSync(
+        path,
+        JSON.stringify([
+          {
+            title: 'Imported over-cap decision',
+            content: 'This imported body is long enough to pass the twenty character floor.',
+            type: 'decision',
+          },
+        ])
+      );
+      const result = runImport(db, 'engram', path);
+      expect(result.imported).toBe(1);
+      const n = (db.prepare('SELECT COUNT(*) as n FROM memories').get() as { n: number }).n;
+      expect(n).toBe(200);
+      const kept = db
+        .prepare("SELECT id FROM memories WHERE title = 'Imported over-cap decision'")
+        .get();
+      expect(kept).toBeDefined();
+    });
   });
 
   describe('v0.4.1 optimizations', () => {

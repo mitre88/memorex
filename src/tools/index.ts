@@ -21,6 +21,7 @@ import { canSave, recordSave, sessionStats } from '../utils/session.js';
 import { logger } from '../utils/logger.js';
 import { getProjectRoot } from '../utils/project.js';
 import { isValidProjectPath, sanitizeFtsQuery, validateTags } from '../utils/security.js';
+import { evictOneIfAtCap } from '../db/evict.js';
 import {
   EMBEDDINGS_ENABLED,
   embedMemory,
@@ -691,49 +692,9 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     return `Session save limit reached (${CONFIG.MAX_SAVES_PER_SESSION}/session).${tail}`;
   }
 
-  // Guard 2: hard cap enforcement. Instead of pulling every row into JS to
-  // find the worst, let SQLite do it. The scoring expression mirrors
-  // scoreMemory() for non-pinned, non-expired rows:
-  //
-  //   score = importance * 2^(-age_days / half_life)
-  //
-  // (popularity boost and FTS relevance are both 0 here — eviction never has
-  // an FTS context and access_count contribution is minor at eviction time.)
-  //
-  // Pinned rows are excluded. Expired rows are preferred for eviction.
-  const totalCount = (db.prepare('SELECT COUNT(*) as n FROM memories').get() as { n: number }).n;
-  if (totalCount >= CONFIG.MAX_MEMORIES) {
-    const hl = SCORING.HALF_LIFE_DAYS;
-    // Cluster-aware eviction: memories that are the sole representative of
-    // their (project × type) cluster get a 2× score penalty, making them
-    // harder to evict than a low-score member of a larger cluster. This
-    // prevents entire topic clusters from being wiped out one by one.
-    // Expired rows are always preferred regardless of cluster membership.
-    const evictStmt = db.prepare(`
-      DELETE FROM memories WHERE id = (
-        SELECT m.id FROM memories m WHERE m.pinned = 0
-        ORDER BY
-          CASE WHEN m.expires_at IS NOT NULL AND m.expires_at < ? THEN 0 ELSE 1 END,
-          importance * pow(0.5, ((? - m.accessed_at) / 86400.0) /
-            CASE m.type
-              WHEN 'feedback'  THEN ${hl.feedback}
-              WHEN 'user'      THEN ${hl.user}
-              WHEN 'project'   THEN ${hl.project}
-              WHEN 'reference' THEN ${hl.reference}
-              ELSE ${hl.default}
-            END
-          ) * CASE
-              WHEN (SELECT COUNT(*) FROM memories c
-                    WHERE COALESCE(c.project, '__g') = COALESCE(m.project, '__g')
-                      AND c.type = m.type AND c.id != m.id) > 0
-                THEN 1.0
-              ELSE 2.0
-            END ASC
-        LIMIT 1
-      )
-    `);
-    evictStmt.run(now, now);
-  }
+  // Guard 2: hard cap. Shared with importers so a bulk import cannot grow
+  // past MAX_MEMORIES (insertRaw used to skip this path).
+  evictOneIfAtCap(db, now);
 
   // Guard 3: fuzzy match. A title hit alone is NOT enough — we also require the
   // bodies to look alike, otherwise we merge unrelated memories that happen to

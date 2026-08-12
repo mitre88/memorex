@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Imports honor the 200-memory cap.** `insertRaw` documented that
+  bulk import still evicted via `saveMemory()`, but it inserted
+  directly and could grow the table without bound. New inserts now
+  share `evictOneIfAtCap()` with `saveMemory()`.
 - **Typecheck no longer requires `@xenova/transformers`.** The optional
   embedding package is skipped on some CI Node versions (Node 20). An
   ambient module stub lets `tsc --noEmit` succeed; runtime still
