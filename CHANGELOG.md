@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Session lock creates `~/.memorex` before mkdir.** The lock is a
+  non-recursive `mkdir` of `session.json.lock`. If the parent dir did not
+  exist yet (fresh install, or tests that set `$HOME` to a temp path),
+  `canSave()` failed closed and callers saw "Session save limit reached".
+  CI on `ubuntu-latest` has no `~/.memorex`, so `tools.test.ts` failed
+  after the v0.10.0 push.
+- **Session file honors `$HOME` at call time.** The path was frozen at
+  import via `os.homedir()`, so tests that set `HOME` still touched the
+  real `~/.memorex/session.json`. The path is now derived per call.
+
 ## [0.10.0] - 2026-06-13
 
 Performance, operability, and memory-footprint pass. No new features, no

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { canSave, recordSave, resetSession, sessionStats } from '../utils/session.js';
@@ -22,6 +22,14 @@ describe('session', () => {
     } catch {
       // Ignore cleanup errors
     }
+  });
+
+  it('allows saves when ~/.memorex does not exist yet', () => {
+    expect(existsSync(join(tempDir, '.memorex'))).toBe(false);
+    expect(canSave()).toBe(true);
+    recordSave();
+    expect(sessionStats().saves).toBe(1);
+    expect(existsSync(join(tempDir, '.memorex', 'session.json'))).toBe(true);
   });
 
   it('starts fresh with 0 saves', () => {
@@ -52,5 +60,26 @@ describe('session', () => {
     const stats = sessionStats();
     expect(stats.saves).toBe(1);
     expect(stats.remaining).toBe(4);
+  });
+
+  it('isolates session state by HOME', () => {
+    const dirA = tempDir;
+    resetSession();
+    for (let i = 0; i < 5; i++) {
+      recordSave();
+    }
+    expect(canSave()).toBe(false);
+
+    const dirB = mkdtempSync(join(tmpdir(), 'memorex-test-b-'));
+    process.env.HOME = dirB;
+    expect(canSave()).toBe(true);
+    recordSave();
+    expect(sessionStats().saves).toBe(1);
+
+    process.env.HOME = dirA;
+    expect(canSave()).toBe(false);
+    expect(sessionStats().saves).toBe(5);
+
+    rmSync(dirB, { recursive: true, force: true });
   });
 });

@@ -7,7 +7,8 @@ import {
   rmdirSync,
   statSync,
 } from 'fs';
-import { dirname } from 'path';
+import { homedir } from 'os';
+import { dirname, join } from 'path';
 import { CONFIG, SESSION } from './config.js';
 
 interface SessionState {
@@ -20,10 +21,23 @@ const LOCK_DIR_SUFFIX = '.lock';
 const STALE_LOCK_SECONDS = 60;
 
 /**
+ * Resolve the session file on every call. Import-time `os.homedir()` froze
+ * CONFIG.SESSION_FILE to the real ~/.memorex path, so tests that set HOME
+ * still raced on one shared counter and CI hit the 5-save cap.
+ */
+function sessionFilePath(): string {
+  return join(process.env.HOME || homedir(), '.memorex', 'session.json');
+}
+
+/**
  * Simple atomic file locking using mkdir (atomic on most filesystems).
  * Detects and removes stale locks older than 60 seconds.
  */
 function acquireLock(lockDir: string): boolean {
+  // mkdir of the lock dir is not recursive — a missing ~/.memorex made
+  // every canSave() fail closed (ENOENT), which tests and first-run
+  // installs reported as "session save limit reached".
+  mkdirSync(dirname(lockDir), { recursive: true, mode: 0o700 });
   try {
     mkdirSync(lockDir, { recursive: false });
     return true;
@@ -83,8 +97,9 @@ function acquireLockWithRetry(lockDir: string): boolean {
 
 function readState(): SessionState {
   try {
-    if (!existsSync(CONFIG.SESSION_FILE)) return fresh();
-    const content = readFileSync(CONFIG.SESSION_FILE, 'utf8');
+    const file = sessionFilePath();
+    if (!existsSync(file)) return fresh();
+    const content = readFileSync(file, 'utf8');
     const parsed = JSON.parse(content) as unknown;
     if (!parsed || typeof parsed !== 'object') return fresh();
     const s = parsed as SessionState;
@@ -108,20 +123,21 @@ function fresh(): SessionState {
 
 function writeState(s: SessionState): void {
   // Ensure directory exists with secure permissions
-  const dir = dirname(CONFIG.SESSION_FILE);
+  const file = sessionFilePath();
+  const dir = dirname(file);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-  writeFileSync(CONFIG.SESSION_FILE, JSON.stringify(s), { mode: 0o600 });
+  writeFileSync(file, JSON.stringify(s), { mode: 0o600 });
   try {
-    chmodSync(CONFIG.SESSION_FILE, 0o600);
+    chmodSync(file, 0o600);
   } catch {
     // Ignore permission errors
   }
 }
 
 export function canSave(): boolean {
-  const lockDir = CONFIG.SESSION_FILE + LOCK_DIR_SUFFIX;
+  const lockDir = sessionFilePath() + LOCK_DIR_SUFFIX;
   if (!acquireLockWithRetry(lockDir)) {
     // All retries exhausted — treat as "cannot confirm slot" and deny the save.
     // This is conservative but now only triggers after sustained contention.
@@ -135,7 +151,7 @@ export function canSave(): boolean {
 }
 
 export function recordSave(): void {
-  const lockDir = CONFIG.SESSION_FILE + LOCK_DIR_SUFFIX;
+  const lockDir = sessionFilePath() + LOCK_DIR_SUFFIX;
   if (!acquireLockWithRetry(lockDir)) {
     // After full retry budget — skip recording (conservative).
     return;
@@ -150,7 +166,7 @@ export function recordSave(): void {
 }
 
 export function resetSession(): void {
-  const lockDir = CONFIG.SESSION_FILE + LOCK_DIR_SUFFIX;
+  const lockDir = sessionFilePath() + LOCK_DIR_SUFFIX;
   if (!acquireLockWithRetry(lockDir)) {
     return;
   }
