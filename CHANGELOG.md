@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Typecheck no longer requires `@xenova/transformers`.** The optional
+  embedding package is skipped on some CI Node versions (Node 20). An
+  ambient module stub lets `tsc --noEmit` succeed; runtime still
+  dynamic-imports and falls back to FTS-only when the package is absent.
 - **Session lock creates `~/.memorex` before mkdir.** The lock is a
   non-recursive `mkdir` of `session.json.lock`. If the parent dir did not
   exist yet (fresh install, or tests that set `$HOME` to a temp path),
