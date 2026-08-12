@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
@@ -52,3 +51,9 @@ temp/
 
 # Session data (runtime)
 *.session.json
+
+# Private local data — never commit user exports or derived analysis
+data/
+analysis/
+chatgpt_conversations*.json
+*_conversations_api.json

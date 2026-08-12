@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-05-18",
+  "features": [
+    {
+      "id": "minimal-harness-adoption",
+      "behavior": "Provide a lightweight repo harness so agents can identify setup, active work, verification, and handoff state without changing memorex runtime behavior.",
+      "state": "complete",
+      "verification": [
+        "npm run typecheck",
+        "npm test",
+        "npm run lint"
+      ],
+      "evidence": [
+        "Added root AGENTS.md, feature_list.json, claude-progress.md, and executable init.sh.",
+        "Verified with Node v24.15.0: npm run typecheck, npm test, and npm run lint all passed."
+      ]
+    }
+  ]
+}
