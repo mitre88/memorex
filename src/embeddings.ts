@@ -72,7 +72,10 @@ export function getEmbedder(): Promise<Embedder | null> {
           task: string,
           model: string
         ) => Promise<
-          (text: string, opts?: { pooling?: string; normalize?: boolean }) => Promise<{
+          (
+            text: string,
+            opts?: { pooling?: string; normalize?: boolean }
+          ) => Promise<{
             data: Float32Array | number[];
           }>
         >;
@@ -131,10 +134,15 @@ export function bufferToVec(buf: Buffer | Uint8Array | null | undefined): Float3
     // Wrong size — corrupt blob or different model. Drop it.
     return null;
   }
-  // Make a copy so we don't tie the Float32Array's lifetime to the buffer's
-  // possibly transient Node-managed memory.
-  const copy = Buffer.from(buf);
-  return new Float32Array(copy.buffer, copy.byteOffset, VECTOR_DIMS);
+  // Copy the raw bytes into a freshly-allocated, tightly-sized ArrayBuffer.
+  // `Buffer.from(buf)` would draw from Node's shared 8 KB pool for a 1.5 KB
+  // blob, leaving each Float32Array as a *view* into that pool — pinning the
+  // whole 8 KB chunk alive and risking aliasing across vectors. A dedicated
+  // Float32Array.buffer is owned solely by this vector (1.5 KB, GC-clean) and
+  // is guaranteed 4-byte aligned.
+  const out = new Float32Array(VECTOR_DIMS);
+  new Uint8Array(out.buffer).set(buf);
+  return out;
 }
 
 // ---- Cosine similarity ---------------------------------------------------

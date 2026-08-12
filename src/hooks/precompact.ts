@@ -22,6 +22,7 @@ import { readFileSync } from 'fs';
 import { getDb } from '../db/index.js';
 import { getProjectRoot } from '../utils/project.js';
 import { TIME, LIMITS } from '../utils/config.js';
+import { collectSessionStats } from '../utils/transcript.js';
 
 interface HookPayload {
   hook_event_name?: string;
@@ -29,17 +30,6 @@ interface HookPayload {
   transcript_path?: string;
   cwd?: string;
   trigger?: string;
-}
-
-interface TranscriptEntry {
-  type?: string;
-  role?: string;
-  message?: {
-    role?: string;
-    content?: unknown;
-  };
-  toolUseResult?: unknown;
-  [key: string]: unknown;
 }
 
 const MAX_PROMPTS = 5;
@@ -54,71 +44,6 @@ function readStdinSync(): string {
   }
 }
 
-function parseTranscript(path: string): TranscriptEntry[] {
-  try {
-    const raw = readFileSync(path, 'utf8');
-    // JSONL: one message object per line.
-    return raw
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line) as TranscriptEntry;
-        } catch {
-          return null;
-        }
-      })
-      .filter((x): x is TranscriptEntry => x !== null);
-  } catch {
-    return [];
-  }
-}
-
-function extractUserPrompts(entries: TranscriptEntry[]): string[] {
-  const prompts: string[] = [];
-  for (const e of entries) {
-    const role = e.message?.role ?? e.role;
-    if (role !== 'user') continue;
-    const content = e.message?.content;
-    if (typeof content === 'string') {
-      prompts.push(content.slice(0, 200));
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (block && typeof block === 'object' && 'text' in block) {
-          const t = (block as { text: unknown }).text;
-          if (typeof t === 'string') prompts.push(t.slice(0, 200));
-        }
-      }
-    }
-  }
-  return prompts.slice(-MAX_PROMPTS);
-}
-
-function extractFilePaths(entries: TranscriptEntry[]): string[] {
-  const files = new Set<string>();
-  const fileKeys = ['file_path', 'path', 'notebook_path'];
-
-  const visit = (node: unknown): void => {
-    if (!node || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-      return;
-    }
-    const obj = node as Record<string, unknown>;
-    for (const key of fileKeys) {
-      const v = obj[key];
-      if (typeof v === 'string' && v.startsWith('/')) {
-        files.add(v);
-      }
-    }
-    for (const v of Object.values(obj)) visit(v);
-  };
-
-  for (const e of entries) visit(e);
-  return Array.from(files).slice(-MAX_FILES);
-}
-
 function main(): void {
   const raw = readStdinSync();
   let payload: HookPayload = {};
@@ -129,9 +54,18 @@ function main(): void {
   }
 
   const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
-  const entries = transcriptPath ? parseTranscript(transcriptPath) : [];
-  const prompts = extractUserPrompts(entries);
-  const files = extractFilePaths(entries);
+  // Single streaming pass — PreCompact fires on the longest sessions, so we
+  // never hold a full parsed entries[] array on top of the transcript string.
+  const stats = transcriptPath
+    ? collectSessionStats(transcriptPath, {
+        maxPrompts: MAX_PROMPTS,
+        maxFiles: MAX_FILES,
+        promptSlice: 200,
+        skipAngleBracket: false,
+      })
+    : null;
+  const prompts = stats?.prompts ?? [];
+  const files = stats?.files ?? [];
   const project = getProjectRoot(payload.cwd ?? process.cwd());
   const sessionId =
     typeof payload.session_id === 'string' ? payload.session_id.slice(0, 40) : 'unknown';

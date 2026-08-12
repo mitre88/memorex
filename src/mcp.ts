@@ -48,10 +48,27 @@ import { EMBEDDINGS_ENABLED } from './embeddings.js';
 export async function runMcpServer(): Promise<void> {
   const server = new McpServer({
     name: 'memorex',
-    version: '0.9.0',
+    version: '0.10.0',
   });
 
   const db = getDb();
+
+  // Close the DB on shutdown so SQLite checkpoints the WAL back into the main
+  // file instead of leaving a growing -wal alongside it. The MCP server is a
+  // long-lived process; Claude Code terminates it with SIGTERM/SIGINT.
+  let closed = false;
+  const shutdown = (): void => {
+    if (closed) return;
+    closed = true;
+    try {
+      db.close();
+    } catch {
+      /* noop — already closing */
+    }
+    process.exit(0);
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 
   server.tool(
     'memory_search',

@@ -171,9 +171,9 @@ export function getGainSummary(db: Database.Database, opts: GainOptions = {}): G
   }
   const hitRatio = denom > 0 ? hits / denom : 0;
 
-  const oldest = db
-    .prepare(`SELECT MIN(ts) AS ts FROM inject_events ${sql}`)
-    .get(...params) as { ts: number | null };
+  const oldest = db.prepare(`SELECT MIN(ts) AS ts FROM inject_events ${sql}`).get(...params) as {
+    ts: number | null;
+  };
 
   return {
     window_days: days,

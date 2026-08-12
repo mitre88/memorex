@@ -1,6 +1,12 @@
 import Database from 'better-sqlite3';
 import { z } from 'zod';
-import { Memory, scoreMemory, estimateTokens, formatMemoryForContext } from '../types/scoring.js';
+import {
+  Memory,
+  scoreMemory,
+  estimateTokens,
+  formatMemoryForContext,
+  memoryColumns,
+} from '../types/scoring.js';
 import {
   CONFIG,
   LIMITS,
@@ -261,7 +267,7 @@ export function getContext(db: Database.Database, input: ContextInputType): stri
   const rows = db
     .prepare(
       `
-      SELECT m.*, CASE
+      SELECT ${memoryColumns('m')}, CASE
         WHEN pinned = 1 THEN 999
         ELSE importance * pow(0.5, ((? - accessed_at) / 86400.0) /
           CASE type
@@ -486,7 +492,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     rows = db
       .prepare(
         `
-      SELECT m.*, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) as fts_rank
+      SELECT ${memoryColumns('m')}, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) as fts_rank
       FROM memories_fts
       JOIN memories m ON m.id = memories_fts.rowid
       WHERE memories_fts MATCH ?
@@ -516,7 +522,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
           const synRows = db
             .prepare(
               `
-            SELECT m.*, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) * 0.7 as fts_rank
+            SELECT ${memoryColumns('m')}, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) * 0.7 as fts_rank
             FROM memories_fts
             JOIN memories m ON m.id = memories_fts.rowid
             WHERE memories_fts MATCH ?
@@ -547,7 +553,7 @@ export function searchMemories(db: Database.Database, input: z.infer<typeof Sear
     rows = db
       .prepare(
         `
-      SELECT *, 0 as fts_rank FROM memories
+      SELECT ${memoryColumns('')}, 0 as fts_rank FROM memories
       WHERE (expires_at IS NULL OR expires_at > ?)
       ORDER BY accessed_at DESC LIMIT 10
     `
@@ -755,9 +761,20 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
 
   const inputTitleWords = wordSet(input.title);
   const inputBodyWords = wordSet(input.body);
+  // Pull only id+title for the title-similarity pass. The body (up to 4 KB
+  // each) is fetched lazily ONLY for candidates whose title already matches —
+  // so a save no longer hauls every same-type body into JS just to compare
+  // titles. In the common case (no title match) zero bodies are read.
   const candidates = db
-    .prepare('SELECT id, title, body FROM memories WHERE type = ?')
-    .all(input.type) as { id: number; title: string; body: string }[];
+    .prepare('SELECT id, title FROM memories WHERE type = ?')
+    .all(input.type) as { id: number; title: string }[];
+
+  let bodyStmt: Database.Statement | null = null;
+  const fetchBody = (id: number): string => {
+    bodyStmt ??= db.prepare('SELECT body FROM memories WHERE id = ?');
+    const r = bodyStmt.get(id) as { body: string } | undefined;
+    return r?.body ?? '';
+  };
 
   const similar = candidates.find((m) => {
     const titleWords = wordSet(m.title);
@@ -774,7 +791,7 @@ export function saveMemory(db: Database.Database, input: z.infer<typeof SaveInpu
     // Title looks like a dup — confirm with body. Short bodies always pass
     // because we can't compute a meaningful Jaccard on <3 words.
     if (inputBodyWords.size < 3) return true;
-    const bodySim = jaccard(inputBodyWords, wordSet(m.body));
+    const bodySim = jaccard(inputBodyWords, wordSet(fetchBody(m.id)));
     return bodySim >= SCORING.FUZZY_BODY_SIMILARITY_MIN;
   });
 
@@ -1225,7 +1242,8 @@ export async function searchMemoriesHybrid(
   const blended = reranking
     .map(({ row, vec }) => ({
       row,
-      score: (1 - SEMANTIC_WEIGHT) * ftsNorm(row.fts_rank) + SEMANTIC_WEIGHT * cosineSim(queryVec, vec),
+      score:
+        (1 - SEMANTIC_WEIGHT) * ftsNorm(row.fts_rank) + SEMANTIC_WEIGHT * cosineSim(queryVec, vec),
     }))
     .sort((a, b) => b.score - a.score);
 
@@ -1249,10 +1267,7 @@ export async function searchMemoriesHybrid(
  * on success, false if embeddings disabled / model load failed / row missing.
  * Used by `embed-rebuild` and by the MCP memory_save fire-and-forget path.
  */
-export async function embedAndStoreMemory(
-  db: Database.Database,
-  id: number
-): Promise<boolean> {
+export async function embedAndStoreMemory(db: Database.Database, id: number): Promise<boolean> {
   const row = db.prepare('SELECT title, body FROM memories WHERE id = ?').get(id) as
     | { title: string; body: string }
     | undefined;
@@ -1279,9 +1294,9 @@ export async function rebuildEmbeddings(
   opts: { onlyMissing?: boolean } = {}
 ): Promise<{ done: number; skipped: number; failed: number }> {
   const where = opts.onlyMissing === false ? '' : 'WHERE embedding IS NULL';
-  const ids = db
-    .prepare(`SELECT id FROM memories ${where} ORDER BY pinned DESC, id ASC`)
-    .all() as { id: number }[];
+  const ids = db.prepare(`SELECT id FROM memories ${where} ORDER BY pinned DESC, id ASC`).all() as {
+    id: number;
+  }[];
   let done = 0;
   let failed = 0;
   for (const { id } of ids) {
@@ -1290,7 +1305,8 @@ export async function rebuildEmbeddings(
     else failed++;
   }
   // skipped = total existing - candidates
-  const skipped = (db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n - ids.length;
+  const skipped =
+    (db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n - ids.length;
   return { done, skipped, failed };
 }
 

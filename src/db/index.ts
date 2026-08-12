@@ -33,6 +33,12 @@ export function getDb(opts: OpenOptions = {}): Database.Database {
     });
   }
 
+  // Track whether the file existed BEFORE we open it. SQLite creates it on
+  // open, so we capture this first to decide if chmod is actually needed —
+  // re-chmod'ing an already-0600 file on every short-lived hook process is a
+  // wasted syscall on the write hot path (every inject/save/prune opens here).
+  const isFresh = !existsSync(dbFile);
+
   let db: Database.Database;
   try {
     db = new Database(dbFile);
@@ -43,15 +49,29 @@ export function getDb(opts: OpenOptions = {}): Database.Database {
     });
   }
 
-  // Set restrictive permissions on database file
-  try {
-    chmodSync(dbFile, 0o600);
-  } catch {
-    // Ignore if permission denied
+  // Set restrictive permissions only when we just created the file. Existing
+  // DBs were already created 0600 by a prior open; skipping the chmod here
+  // removes one syscall from every writable open.
+  if (isFresh) {
+    try {
+      chmodSync(dbFile, 0o600);
+    } catch {
+      // Ignore if permission denied
+    }
   }
 
   try {
+    // busy_timeout: short-lived hook processes (prompt inject-log, subagent
+    // capture, stop-prune) can write concurrently. Without a timeout the loser
+    // throws SQLITE_BUSY and silently drops its write. 5s lets it wait for the
+    // single writer instead — fewer lost analytics events and saves.
+    db.pragma('busy_timeout = 5000');
     db.pragma('journal_mode = WAL');
+    // synchronous = NORMAL is the recommended pairing with WAL: durable across
+    // app crashes (only an OS crash / power loss can lose the last commit, an
+    // acceptable risk for a memory cache) while avoiding an fsync on every
+    // commit. Roughly halves write latency for the insert-heavy hooks.
+    db.pragma('synchronous = NORMAL');
     db.pragma('foreign_keys = ON');
     applySchema(db);
   } catch (error) {
@@ -83,6 +103,9 @@ export function getDbReadonly(opts: OpenOptions = {}): Database.Database | null 
   try {
     const db = new Database(dbFile, { readonly: true, fileMustExist: true });
     db.pragma('query_only = ON');
+    // Even readers can briefly contend with a checkpoint; a small timeout
+    // turns a rare SQLITE_BUSY on the inject hot path into a short wait.
+    db.pragma('busy_timeout = 2000');
     return db;
   } catch {
     return null;

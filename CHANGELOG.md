@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-13
+
+Performance, operability, and memory-footprint pass. No new features, no
+behavior change for callers — every memory operation just gets faster, more
+robust under concurrency, and the package builds on current Node.
+
+### Fixed
+
+- **Build on Node ≥ 24/26.** Bumped `better-sqlite3` `^11.9.1` → `^12.10.1`
+  (and `@types/better-sqlite3`). v11 fails to compile against Node 26's V8
+  API (`make` errors on `better_sqlite3.o`); v12 ships prebuilt binaries and
+  compiles cleanly. The better-sqlite3 surface we use (`prepare`/`run`/`get`/
+  `all`/`pragma`/`transaction`/`exec`/`close`) is unchanged — zero code edits
+  required.
+
+### Changed
+
+- **`synchronous = NORMAL` on writable connections.** The recommended pairing
+  with WAL: durable across app crashes (only an OS crash / power loss can drop
+  the last commit — acceptable for a memory cache) while skipping an `fsync`
+  on every commit. Measured **~44% faster** on the save+eviction path
+  (≈2.15 ms → ≈1.1 ms/op) — benefits every insert-heavy hook (inject log,
+  subagent capture, pre-compact snapshot, stop-prune).
+- **`busy_timeout` (5 s writable / 2 s readonly).** Short-lived hook processes
+  can write concurrently; without a timeout the loser threw `SQLITE_BUSY` and
+  silently dropped its write. Now it waits for the single writer instead —
+  fewer lost inject events and saves under contention.
+- **Skip `chmod` on warm DB opens.** The `0600` chmod now runs only when the
+  DB file is freshly created, removing a syscall from every short-lived hook
+  write. Warm `getDb()` open **~31% faster**.
+- **Project-cache GC.** Expired/malformed `cwd` entries are pruned when the
+  cache is rewritten, so `project-cache.json` no longer accumulates one entry
+  per directory ever visited.
+- **One SQLite connection per prompt instead of two.** The UserPromptSubmit
+  hook opened a *readonly* handle to search and then a *second, writable* handle
+  to log the analytics event. The v0.8 analytics insert means every prompt
+  writes anyway, so the readonly handle bought nothing — the hook now uses a
+  single writable connection for both. Also starts collecting analytics from
+  the first prompt on a fresh install (the readonly path used to bail before
+  the DB existed).
+- **`saveMemory` fuzzy dedup stops loading every same-type body.** The dup check
+  now selects only `id, title` for the title-similarity pass and fetches a
+  candidate's body (up to 4 KB) lazily, only when its title already matches. In
+  the common no-match case, zero bodies are read into JS.
+
+### Memory
+
+- **`bufferToVec` no longer pins Node's shared 8 KB buffer pool.** A 1.5 KB
+  embedding blob read via `Buffer.from` drew from Node's pooled allocator,
+  leaving each `Float32Array` as a *view* into the shared 8 KB chunk — pinning
+  it alive and risking aliasing across vectors during rerank. Each vector now
+  owns a tight, 4-byte-aligned 1.5 KB `ArrayBuffer`.
+- **Read paths no longer haul the embedding BLOB into JS.** Inject, `memory_search`
+  (+ synonym + recency fallback), and `memory_context` selected `m.*`, pulling
+  the 1.5 KB `embedding` column for every matched row only to discard it — up to
+  ~60 KB of `Buffer`s allocated and GC'd per search once embeddings are
+  populated. They now select the explicit `Memory` column list via
+  `memoryColumns()`; only `searchMemoriesHybrid` (which actually reranks on the
+  vector) still reads it.
+- **Transcript hooks stream instead of buffering the whole parse.** Stop,
+  PreCompact, and SubagentStop used to `readFileSync` + `split` + `JSON.parse`
+  every line into a retained `entries[]` array, then iterate it 2–3×. PreCompact
+  fires precisely on the longest sessions — the worst moment to hold the file
+  string *and* a full array of parsed message objects. A shared single-pass
+  reader (`src/utils/transcript.ts`) now extracts a bounded ring of recent
+  prompts, a file Set, and the time span without retaining entries. Measured on
+  a 25 MB / 40k-entry transcript: peak heap **+60 MB → +38 MB (≈36% lower)**.
+  Also dedupes ~150 lines of copy-pasted parse logic across the three hooks
+  (now unit-tested in `transcript.test.ts`).
+
+### Operability
+
+- **MCP server checkpoints WAL on shutdown.** `SIGINT`/`SIGTERM` now close the
+  DB cleanly so the `-wal` sidecar folds back into the main file instead of
+  growing across the long-lived server's lifetime.
+- **Dependency advisories.** `npm audit fix` cleared 8 transitive advisories
+  (incl. `qs` DoS). The remaining advisories are confined to the **optional**
+  `@xenova/transformers` → `onnxruntime-web` chain, which is only installed /
+  loaded when `MEMOREX_EMBEDDINGS=1`; the default install never touches it.
+
 ## [0.9.0] - 2026-04-24
 
 Hybrid semantic search via local sentence embeddings. Opt-in (set
@@ -431,7 +511,8 @@ and fewer writes per operation.
 - 4 memory types: user, project, feedback, reference
 - Session hooks for start/end
 
-[unreleased]: https://github.com/mitre88/memorex/compare/v0.9.0...HEAD
+[unreleased]: https://github.com/mitre88/memorex/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/mitre88/memorex/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mitre88/memorex/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mitre88/memorex/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mitre88/memorex/compare/v0.6.0...v0.7.0

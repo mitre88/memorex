@@ -42,9 +42,8 @@ for (const name of HOOKS) {
     // survive as a plain `import Database from 'better-sqlite3'`, resolved
     // at hook runtime from the plugin's own node_modules.
     external: ['better-sqlite3'],
-    // Banner: the shebang is preserved from source already, but some entries
-    // had it; esbuild strips it. Re-add so users can still `./hooks/x.js`.
-    banner: { js: '#!/usr/bin/env node' },
+    // esbuild preserves the source shebang for these ESM entrypoints. Adding a
+    // banner here would create a second hashbang, which Node rejects.
     // Don't bother minifying — these are small and we want stack traces.
     minify: false,
     sourcemap: false,

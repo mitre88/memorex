@@ -99,6 +99,15 @@ export function getProjectRoot(cwd: string = process.cwd()): string {
   const fromGit = runGitToplevel(cwd);
   const root = fromGit ?? cwd;
 
+  // GC expired/malformed entries so the on-disk cache doesn't accumulate a
+  // stale entry for every cwd ever visited. Bounded by the same TTL we honor
+  // on read, so this never evicts something a read would have trusted.
+  for (const key of Object.keys(cache)) {
+    if (key === cwd) continue;
+    const at = cache[key]?.at;
+    if (typeof at !== 'number' || now - at >= PROJECT_CACHE_TTL_SECONDS) delete cache[key];
+  }
+
   // Persist even cwd-fallback results — avoids retrying git on non-repo dirs.
   cache[cwd] = { root, at: now };
   writeDiskCache(cache);

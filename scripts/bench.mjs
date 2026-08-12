@@ -132,5 +132,28 @@ console.log('\nEviction (at 200-row cap):');
   db.close();
 }
 
+// --- Inject hot path: old (2 opens/prompt) vs new (1 open/prompt) ---
+console.log('\nInject hot path (per prompt — runs on EVERY user prompt):');
+{
+  const insert = "INSERT INTO inject_events (status) VALUES ('skip-empty')";
+  const probe = 'SELECT id FROM memories LIMIT 1';
+  // OLD: readonly handle for search + a SECOND writable handle for the log.
+  time('OLD: readonly search + writable log (2 opens)', 100, () => {
+    const ro = getDbReadonly({ path: dbPath });
+    ro?.prepare(probe).get();
+    ro?.close();
+    const rw = getDb({ path: dbPath });
+    rw.prepare(insert).run();
+    rw.close();
+  });
+  // NEW: one writable handle serves both the search read and the log write.
+  time('NEW: single writable conn (1 open)', 100, () => {
+    const rw = getDb({ path: dbPath });
+    rw.prepare(probe).get();
+    rw.prepare(insert).run();
+    rw.close();
+  });
+}
+
 rmSync(tmp, { recursive: true, force: true });
 console.log('\ndone.');

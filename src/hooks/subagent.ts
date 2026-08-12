@@ -15,6 +15,7 @@ import { readFileSync } from 'fs';
 import { getDb } from '../db/index.js';
 import { getProjectRoot } from '../utils/project.js';
 import { LIMITS, TIME } from '../utils/config.js';
+import { collectFirstUserLastAssistant } from '../utils/transcript.js';
 
 interface HookPayload {
   session_id?: unknown;
@@ -24,16 +25,6 @@ interface HookPayload {
   subagent_type?: unknown;
 }
 
-interface TranscriptEntry {
-  type?: string;
-  role?: string;
-  message?: {
-    role?: string;
-    content?: unknown;
-  };
-  [key: string]: unknown;
-}
-
 const TTL_DAYS = 30;
 
 function readStdinSync(): string {
@@ -41,66 +32,6 @@ function readStdinSync(): string {
     return readFileSync(0, 'utf8');
   } catch {
     return '';
-  }
-}
-
-function lastAssistantText(entries: TranscriptEntry[]): string {
-  // Walk backward; the most recent assistant message is the synthesized result.
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    const role = e.message?.role ?? e.role;
-    if (role !== 'assistant') continue;
-    const content = e.message?.content;
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      const parts: string[] = [];
-      for (const block of content) {
-        if (block && typeof block === 'object' && 'text' in block) {
-          const t = (block as { text: unknown }).text;
-          if (typeof t === 'string') parts.push(t);
-        }
-      }
-      if (parts.length > 0) return parts.join('\n');
-    }
-  }
-  return '';
-}
-
-function firstUserText(entries: TranscriptEntry[]): string {
-  for (const e of entries) {
-    const role = e.message?.role ?? e.role;
-    if (role !== 'user') continue;
-    const content = e.message?.content;
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (block && typeof block === 'object' && 'text' in block) {
-          const t = (block as { text: unknown }).text;
-          if (typeof t === 'string') return t;
-        }
-      }
-    }
-  }
-  return '';
-}
-
-function parseTranscript(path: string): TranscriptEntry[] {
-  try {
-    const raw = readFileSync(path, 'utf8');
-    return raw
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line) as TranscriptEntry;
-        } catch {
-          return null;
-        }
-      })
-      .filter((x): x is TranscriptEntry => x !== null);
-  } catch {
-    return [];
   }
 }
 
@@ -116,13 +47,15 @@ function main(): void {
   const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
   if (!transcriptPath) return;
 
-  const entries = parseTranscript(transcriptPath);
-  if (entries.length === 0) return;
+  // One streaming pass captures both the delegated task (first user message)
+  // and the synthesized result (last assistant message) — no retained array.
+  const texts = collectFirstUserLastAssistant(transcriptPath);
+  if (!texts) return;
 
-  const result = lastAssistantText(entries);
+  const result = texts.lastAssistant;
   if (!result || result.length < 40) return; // nothing worth saving
 
-  const task = firstUserText(entries).slice(0, 200);
+  const task = texts.firstUser.slice(0, 200);
   const agentName =
     (typeof payload.subagent_type === 'string' && payload.subagent_type) ||
     (typeof payload.agent_name === 'string' && payload.agent_name) ||

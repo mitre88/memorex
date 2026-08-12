@@ -150,7 +150,7 @@ function checkFtsSync(db: Database.Database): CheckResult {
       'WARN',
       'fts.sync',
       `memories=${m}, memories_fts=${f} — index drift`,
-      "Run `sqlite3 ~/.memorex/memories.db \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\"`."
+      'Run `sqlite3 ~/.memorex/memories.db "INSERT INTO memories_fts(memories_fts) VALUES(\'rebuild\');"`.'
     );
   } catch (err) {
     return check('FAIL', 'fts.sync', `cannot count: ${(err as Error).message}`);
@@ -281,7 +281,11 @@ function checkRecentActivity(db: Database.Database): CheckResult {
     }
     return check('OK', 'activity', `${recent} inject events in last 7d`);
   } catch (err) {
-    return check('OK', 'activity', `inject_events table not yet present (${(err as Error).message})`);
+    return check(
+      'OK',
+      'activity',
+      `inject_events table not yet present (${(err as Error).message})`
+    );
   }
 }
 
@@ -331,7 +335,9 @@ export function formatDoctorReport(report: DoctorReport): string {
     if (r.fix) lines.push(`        ↳ ${r.fix}`);
   }
   lines.push('');
-  lines.push(`Summary: ${report.summary.ok} OK, ${report.summary.warn} WARN, ${report.summary.fail} FAIL`);
+  lines.push(
+    `Summary: ${report.summary.ok} OK, ${report.summary.warn} WARN, ${report.summary.fail} FAIL`
+  );
   return lines.join('\n');
 }
 

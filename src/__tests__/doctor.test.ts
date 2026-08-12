@@ -35,7 +35,14 @@ describe('doctor', () => {
   it('reports OK on a freshly-initialized DB (modulo hooks check)', () => {
     const r = runDoctor(db);
     // Schema version, integrity, fts.sync, capacity, activity all OK
-    const dbChecks = r.results.filter((c) => c.name.startsWith('schema') || c.name === 'integrity' || c.name === 'fts.sync' || c.name === 'capacity' || c.name === 'activity');
+    const dbChecks = r.results.filter(
+      (c) =>
+        c.name.startsWith('schema') ||
+        c.name === 'integrity' ||
+        c.name === 'fts.sync' ||
+        c.name === 'capacity' ||
+        c.name === 'activity'
+    );
     for (const c of dbChecks) {
       expect(c.level).toBe('OK');
     }
@@ -55,9 +62,7 @@ describe('doctor', () => {
 
   it('flags capacity at >=90%', () => {
     // Fill to 91% (181/200) — fast direct inserts skipping triggers/anti-bloat.
-    const insert = db.prepare(
-      `INSERT INTO memories (type, title, body) VALUES ('user', ?, 'b')`
-    );
+    const insert = db.prepare(`INSERT INTO memories (type, title, body) VALUES ('user', ?, 'b')`);
     db.transaction(() => {
       for (let i = 0; i < 181; i++) insert.run(`row-${i}`);
     })();
@@ -68,18 +73,10 @@ describe('doctor', () => {
   });
 
   it('exit code 0 on all-OK, 1 on WARN, 2 on FAIL', () => {
-    expect(
-      doctorExitCode({ results: [], summary: { ok: 5, warn: 0, fail: 0 } })
-    ).toBe(0);
-    expect(
-      doctorExitCode({ results: [], summary: { ok: 4, warn: 1, fail: 0 } })
-    ).toBe(1);
-    expect(
-      doctorExitCode({ results: [], summary: { ok: 4, warn: 0, fail: 1 } })
-    ).toBe(2);
-    expect(
-      doctorExitCode({ results: [], summary: { ok: 4, warn: 1, fail: 1 } })
-    ).toBe(2);
+    expect(doctorExitCode({ results: [], summary: { ok: 5, warn: 0, fail: 0 } })).toBe(0);
+    expect(doctorExitCode({ results: [], summary: { ok: 4, warn: 1, fail: 0 } })).toBe(1);
+    expect(doctorExitCode({ results: [], summary: { ok: 4, warn: 0, fail: 1 } })).toBe(2);
+    expect(doctorExitCode({ results: [], summary: { ok: 4, warn: 1, fail: 1 } })).toBe(2);
   });
 
   it('renders text report with status tags', () => {

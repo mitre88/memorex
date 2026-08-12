@@ -42,7 +42,7 @@ import {
 } from './analytics.js';
 import { runDoctor, formatDoctorReport, doctorExitCode } from './doctor.js';
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 
 type Parsed = {
   positional: string[];

@@ -19,19 +19,12 @@ import { getDb } from '../db/index.js';
 import { scoreMemory, type Memory } from '../types/scoring.js';
 import { TIME, PRUNE_DEFAULTS, SCORING, LIMITS } from '../utils/config.js';
 import { getProjectRoot } from '../utils/project.js';
+import { collectSessionStats } from '../utils/transcript.js';
 
 interface HookPayload {
   session_id?: unknown;
   transcript_path?: unknown;
   cwd?: unknown;
-}
-
-interface TranscriptEntry {
-  type?: string;
-  role?: string;
-  message?: { role?: string; content?: unknown };
-  timestamp?: string;
-  [key: string]: unknown;
 }
 
 const SUMMARY_TTL_DAYS = 14;
@@ -47,90 +40,27 @@ function readStdinSync(): string {
   }
 }
 
-function parseTranscript(path: string): TranscriptEntry[] {
-  try {
-    const raw = readFileSync(path, 'utf8');
-    return raw
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((l) => {
-        try {
-          return JSON.parse(l) as TranscriptEntry;
-        } catch {
-          return null;
-        }
-      })
-      .filter((x): x is TranscriptEntry => x !== null);
-  } catch {
-    return [];
-  }
-}
-
-function extractUserPrompts(entries: TranscriptEntry[]): string[] {
-  const prompts: string[] = [];
-  for (const e of entries) {
-    const role = e.message?.role ?? e.role;
-    if (role !== 'user') continue;
-    const content = e.message?.content;
-    if (typeof content === 'string') {
-      const trimmed = content.trim();
-      if (trimmed && !trimmed.startsWith('<')) prompts.push(trimmed.slice(0, 160));
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (block && typeof block === 'object' && 'text' in block) {
-          const t = (block as { text: unknown }).text;
-          if (typeof t === 'string') {
-            const trimmed = t.trim();
-            if (trimmed && !trimmed.startsWith('<')) prompts.push(trimmed.slice(0, 160));
-          }
-        }
-      }
-    }
-  }
-  return prompts;
-}
-
-function extractFilePaths(entries: TranscriptEntry[]): string[] {
-  const files = new Set<string>();
-  const keys = ['file_path', 'path', 'notebook_path'];
-  const visit = (node: unknown): void => {
-    if (!node || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-      return;
-    }
-    const obj = node as Record<string, unknown>;
-    for (const k of keys) {
-      const v = obj[k];
-      if (typeof v === 'string' && v.startsWith('/')) files.add(v);
-    }
-    for (const v of Object.values(obj)) visit(v);
-  };
-  for (const e of entries) visit(e);
-  return Array.from(files);
-}
-
-function sessionDurationMinutes(entries: TranscriptEntry[]): number | null {
-  const timestamps = entries
-    .map((e) => (typeof e.timestamp === 'string' ? Date.parse(e.timestamp) : NaN))
-    .filter((n) => Number.isFinite(n));
-  if (timestamps.length < 2) return null;
-  timestamps.sort((a, b) => a - b);
-  return Math.round((timestamps[timestamps.length - 1] - timestamps[0]) / 60000);
-}
-
 function writeSessionSummary(db: ReturnType<typeof getDb>, payload: HookPayload): void {
   const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
   if (!transcriptPath) return;
-  const entries = parseTranscript(transcriptPath);
-  if (entries.length === 0) return;
 
-  const prompts = extractUserPrompts(entries).slice(-SUMMARY_MAX_PROMPTS);
+  // Single streaming pass — no retained entries[] array (see utils/transcript).
+  const stats = collectSessionStats(transcriptPath, {
+    maxPrompts: SUMMARY_MAX_PROMPTS,
+    maxFiles: SUMMARY_MAX_FILES,
+    promptSlice: 160,
+    skipAngleBracket: true,
+  });
+  if (!stats) return;
+
+  const prompts = stats.prompts;
   if (prompts.length < MIN_PROMPTS_TO_SUMMARIZE) return; // too short to be worth summarizing
 
-  const files = extractFilePaths(entries).slice(-SUMMARY_MAX_FILES);
-  const duration = sessionDurationMinutes(entries);
+  const files = stats.files;
+  const duration =
+    stats.minTs !== null && stats.maxTs !== null && stats.maxTs > stats.minTs
+      ? Math.round((stats.maxTs - stats.minTs) / 60000)
+      : null;
   const project = getProjectRoot(typeof payload.cwd === 'string' ? payload.cwd : process.cwd());
   const sessionId =
     typeof payload.session_id === 'string' ? payload.session_id.slice(0, 40) : 'unknown';

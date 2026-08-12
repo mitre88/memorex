@@ -100,25 +100,27 @@ describe('db initialization', () => {
     expect(v).toBeGreaterThanOrEqual(7);
 
     const t = db
-      .prepare(
-        `SELECT name FROM sqlite_master WHERE type='table' AND name='inject_events'`
-      )
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='inject_events'`)
       .get();
     expect(t).toBeDefined();
 
     const cols = db.pragma('table_info(inject_events)') as { name: string }[];
     const colNames = cols.map((c) => c.name).sort();
-    expect(colNames).toEqual(
-      ['budget', 'id', 'memory_ids', 'project', 'prompt_chars', 'session_id', 'status', 'tokens', 'ts']
-    );
+    expect(colNames).toEqual([
+      'budget',
+      'id',
+      'memory_ids',
+      'project',
+      'prompt_chars',
+      'session_id',
+      'status',
+      'tokens',
+      'ts',
+    ]);
 
     // CHECK constraint enforces status enum
     expect(() =>
-      db
-        .prepare(
-          `INSERT INTO inject_events (status, memory_ids) VALUES ('garbage', '[]')`
-        )
-        .run()
+      db.prepare(`INSERT INTO inject_events (status, memory_ids) VALUES ('garbage', '[]')`).run()
     ).toThrow();
     db.close();
   });
@@ -135,9 +137,7 @@ describe('db initialization', () => {
 
     // Partial index exists
     const idx = db
-      .prepare(
-        `SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_embedding'`
-      )
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_memories_embedding'`)
       .get() as { sql: string } | undefined;
     expect(idx).toBeDefined();
     expect(idx!.sql).toMatch(/WHERE\s+embedding\s+IS\s+NOT\s+NULL/i);

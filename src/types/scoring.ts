@@ -16,6 +16,24 @@ export interface Memory {
   fts_score?: number;
 }
 
+/**
+ * Explicit column list matching the `Memory` interface. Used instead of
+ * `SELECT m.*` on read paths so the 1.5 KB `embedding` BLOB (added in the v0.9
+ * schema) is NOT hauled from SQLite into JS and silently discarded on every
+ * inject / search / context query. Only `searchMemoriesHybrid` reads the
+ * embedding, so only it selects `m.*`.
+ *
+ * Keep in sync with the `Memory` interface above when adding columns.
+ */
+export function memoryColumns(alias = 'm'): string {
+  const a = alias ? `${alias}.` : '';
+  return (
+    `${a}id, ${a}type, ${a}title, ${a}body, ${a}project, ${a}tags, ` +
+    `${a}importance, ${a}access_count, ${a}pinned, ${a}created_at, ` +
+    `${a}accessed_at, ${a}expires_at`
+  );
+}
+
 const NOW = () => Math.floor(Date.now() / 1000);
 
 /**

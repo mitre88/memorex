@@ -23,8 +23,8 @@
  */
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { getDb, getDbReadonly } from '../db/index.js';
-import { scoreMemory, estimateTokens, type Memory } from '../types/scoring.js';
+import { getDb } from '../db/index.js';
+import { scoreMemory, estimateTokens, memoryColumns, type Memory } from '../types/scoring.js';
 import { PATHS, SCORING } from '../utils/config.js';
 import { getProjectRoot } from '../utils/project.js';
 import { sanitizeFtsQuery } from '../utils/security.js';
@@ -43,40 +43,32 @@ interface InjectEvent {
 
 /**
  * Persist a single inject event to the `inject_events` table for `memorex gain`.
- * Best-effort — never blocks the hook. Opens a writable handle briefly because
- * the readonly handle used for search can't write. Total cost ~1ms warm, which
- * we eat once per prompt to feed analytics.
+ * Best-effort — never blocks the hook. Reuses the single writable connection the
+ * hook already holds (see main): the v0.8 analytics insert means every prompt
+ * writes anyway, so opening a SEPARATE writable handle here — on top of a
+ * readonly search handle — was paying for two SQLite opens per prompt for no
+ * benefit. One connection now serves both the search read and this write.
  *
  * We log both successful injects and skips so `gain` can compute the real
  * coverage rate ("of N prompts this week, X% had matching context").
  */
-function logInjectEvent(ev: InjectEvent): void {
-  let writable: ReturnType<typeof getDb> | null = null;
+function logInjectEvent(db: ReturnType<typeof getDb>, ev: InjectEvent): void {
   try {
-    writable = getDb();
-    writable
-      .prepare(
-        `INSERT INTO inject_events
-           (session_id, project, memory_ids, tokens, budget, prompt_chars, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        ev.sessionId || null,
-        ev.project || null,
-        JSON.stringify(ev.memoryIds),
-        ev.tokens,
-        ev.budget,
-        ev.promptChars,
-        ev.status
-      );
+    db.prepare(
+      `INSERT INTO inject_events
+         (session_id, project, memory_ids, tokens, budget, prompt_chars, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      ev.sessionId || null,
+      ev.project || null,
+      JSON.stringify(ev.memoryIds),
+      ev.tokens,
+      ev.budget,
+      ev.promptChars,
+      ev.status
+    );
   } catch {
     /* analytics is best-effort; never break the hook */
-  } finally {
-    try {
-      writable?.close();
-    } catch {
-      /* noop */
-    }
   }
 }
 
@@ -200,9 +192,15 @@ function main(): void {
   const now = Math.floor(Date.now() / 1000);
   const budget = adaptiveBudget(prompt.length);
 
-  const db = getDbReadonly();
-  if (!db) {
-    // DB missing — can't search OR log. Truly silent fresh-install path.
+  // Single writable connection serves both the search read and the analytics
+  // insert. (Previously: a readonly handle for search + a second writable
+  // handle for logging = two SQLite opens per prompt.) getDb() creates the DB
+  // on a fresh install, so analytics starts collecting from the first prompt.
+  let db: ReturnType<typeof getDb>;
+  try {
+    db = getDb();
+  } catch {
+    // Can't open or create the DB — can't search or log. Stay silent.
     return;
   }
 
@@ -216,7 +214,7 @@ function main(): void {
     const rows = db
       .prepare(
         `
-      SELECT m.*, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) as fts_rank
+      SELECT ${memoryColumns('m')}, bm25(memories_fts, ${wt}, ${wb}, ${wtags}) as fts_rank
       FROM memories_fts
       JOIN memories m ON m.id = memories_fts.rowid
       WHERE memories_fts MATCH ?
@@ -231,7 +229,7 @@ function main(): void {
     })[];
 
     if (rows.length === 0) {
-      logInjectEvent({
+      logInjectEvent(db, {
         status: 'skip-empty',
         sessionId,
         project,
@@ -254,7 +252,7 @@ function main(): void {
       // Distinguish dedup-killed from min-score-killed: if rows existed but
       // we excluded everything via LRU, the "next prompt" already saw them.
       const status = excludedIds.size > 0 ? 'skip-dedup' : 'skip-empty';
-      logInjectEvent({
+      logInjectEvent(db, {
         status,
         sessionId,
         project,
@@ -278,7 +276,7 @@ function main(): void {
       tokens += cost;
     }
     if (lines.length === 0) {
-      logInjectEvent({
+      logInjectEvent(db, {
         status: 'skip-empty',
         sessionId,
         project,
@@ -292,7 +290,7 @@ function main(): void {
 
     process.stdout.write(`${PREAMBLE}\n${lines.join('\n')}\n${POSTAMBLE}\n`);
 
-    logInjectEvent({
+    logInjectEvent(db, {
       status: 'inject',
       sessionId,
       project,
@@ -321,7 +319,7 @@ function main(): void {
     }
   } catch {
     // Any DB or SQL error → silent no-op. The user's prompt must never break.
-    logInjectEvent({
+    logInjectEvent(db, {
       status: 'skip-error',
       sessionId,
       project,
