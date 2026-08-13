@@ -441,9 +441,11 @@ describe('tools', () => {
         `INSERT INTO memories (type, title, body, importance, created_at, accessed_at)
          VALUES ('reference', ?, 'filler body for cap testing purposes here', 0.1, ?, ?)`
       );
-      for (let i = 0; i < 200; i++) {
-        insert.run(`Filler ${i}`, now - 86400, now - 86400);
-      }
+      db.transaction(() => {
+        for (let i = 0; i < 200; i++) {
+          insert.run(`Filler ${i}`, now - 86400, now - 86400);
+        }
+      })();
       const path = join(tempDir, 'overcap.json');
       writeFileSync(
         path,
@@ -463,7 +465,7 @@ describe('tools', () => {
         .prepare("SELECT id FROM memories WHERE title = 'Imported over-cap decision'")
         .get();
       expect(kept).toBeDefined();
-    });
+    }, 15_000);
   });
 
   describe('v0.4.1 optimizations', () => {
