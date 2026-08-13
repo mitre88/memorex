@@ -16,6 +16,7 @@
  */
 import { readFileSync } from 'fs';
 import { getDb } from '../db/index.js';
+import { insertSystemMemory } from '../db/evict.js';
 import { scoreMemory, type Memory } from '../types/scoring.js';
 import { TIME, PRUNE_DEFAULTS, SCORING, LIMITS } from '../utils/config.js';
 import { getProjectRoot } from '../utils/project.js';
@@ -88,10 +89,16 @@ function writeSessionSummary(db: ReturnType<typeof getDb>, payload: HookPayload)
   const title = `Session summary: ${ts}`;
   const tags = JSON.stringify(['session-summary', `session-${sessionId}`]);
   try {
-    db.prepare(
-      `INSERT INTO memories (type, title, body, project, tags, importance, pinned, created_at, accessed_at, expires_at)
-       VALUES ('project', ?, ?, ?, ?, 0.45, 0, ?, ?, ?)`
-    ).run(title, body, project, tags, now, now, expiresAt);
+    insertSystemMemory(db, {
+      type: 'project',
+      title,
+      body,
+      project,
+      tags,
+      importance: 0.45,
+      now,
+      expiresAt,
+    });
   } catch {
     // Best-effort — closing must proceed regardless.
   }

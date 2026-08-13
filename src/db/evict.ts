@@ -3,8 +3,8 @@ import { CONFIG, SCORING } from '../utils/config.js';
 
 /**
  * Enforce the 200-memory hard cap by deleting one lowest-score unpinned row.
- * Used by saveMemory and by importers (insertRaw used to skip this and grow
- * past the cap).
+ * Used by saveMemory, importers, and system hooks (Stop / PreCompact /
+ * SubagentStop used to INSERT raw and grow past the cap).
  *
  * Scoring matches scoreMemory() for non-pinned rows:
  *   score = importance * 2^(-age_days / half_life)
@@ -44,4 +44,39 @@ export function evictOneIfAtCap(
       )
     `
   ).run(now, now);
+}
+
+export interface SystemMemoryInsert {
+  type: 'project' | 'feedback' | 'user' | 'reference';
+  title: string;
+  body: string;
+  project: string | null;
+  tags: string;
+  importance: number;
+  now?: number;
+  expiresAt?: number | null;
+}
+
+/**
+ * System-driven insert that still respects the 200-memory cap.
+ * Hooks bypass the per-session save rate limit on purpose; they must
+ * not also bypass the hard cap.
+ */
+export function insertSystemMemory(db: Database.Database, mem: SystemMemoryInsert): void {
+  const now = mem.now ?? Math.floor(Date.now() / 1000);
+  evictOneIfAtCap(db, now);
+  db.prepare(
+    `INSERT INTO memories (type, title, body, project, tags, importance, pinned, created_at, accessed_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
+  ).run(
+    mem.type,
+    mem.title,
+    mem.body,
+    mem.project,
+    mem.tags,
+    mem.importance,
+    now,
+    now,
+    mem.expiresAt ?? null
+  );
 }

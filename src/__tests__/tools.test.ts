@@ -15,6 +15,7 @@ import {
   mergeMemories,
 } from '../tools/index.js';
 import { runImport } from '../importers.js';
+import { insertSystemMemory } from '../db/evict.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { resetSession, canSave, recordSave } from '../utils/session.js';
 
@@ -463,6 +464,35 @@ describe('tools', () => {
       expect(n).toBe(200);
       const kept = db
         .prepare("SELECT id FROM memories WHERE title = 'Imported over-cap decision'")
+        .get();
+      expect(kept).toBeDefined();
+    }, 15_000);
+
+    it('enforces the 200-memory cap on system hook inserts', () => {
+      const now = Math.floor(Date.now() / 1000);
+      const insert = db.prepare(
+        `INSERT INTO memories (type, title, body, importance, created_at, accessed_at)
+         VALUES ('reference', ?, 'filler body for cap testing purposes here', 0.1, ?, ?)`
+      );
+      db.transaction(() => {
+        for (let i = 0; i < 200; i++) {
+          insert.run(`Hook filler ${i}`, now - 86400, now - 86400);
+        }
+      })();
+      insertSystemMemory(db, {
+        type: 'project',
+        title: 'Pre-compact snapshot: over-cap',
+        body: 'System hook body long enough to count as a real snapshot.',
+        project: '/tmp/demo',
+        tags: JSON.stringify(['compaction']),
+        importance: 0.6,
+        now,
+        expiresAt: now + 7 * 86400,
+      });
+      const n = (db.prepare('SELECT COUNT(*) as n FROM memories').get() as { n: number }).n;
+      expect(n).toBe(200);
+      const kept = db
+        .prepare("SELECT id FROM memories WHERE title = 'Pre-compact snapshot: over-cap'")
         .get();
       expect(kept).toBeDefined();
     }, 15_000);

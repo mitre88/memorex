@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hook inserts honor the 200-memory cap.** Stop, PreCompact, and
+  SubagentStop inserted raw rows (rate-limit bypass is intentional;
+  the hard cap was not). They now share `insertSystemMemory()`.
 - **Imports honor the 200-memory cap.** `insertRaw` documented that
   bulk import still evicted via `saveMemory()`, but it inserted
   directly and could grow the table without bound. New inserts now
@@ -61,7 +64,7 @@ robust under concurrency, and the package builds on current Node.
   cache is rewritten, so `project-cache.json` no longer accumulates one entry
   per directory ever visited.
 - **One SQLite connection per prompt instead of two.** The UserPromptSubmit
-  hook opened a *readonly* handle to search and then a *second, writable* handle
+  hook opened a _readonly_ handle to search and then a _second, writable_ handle
   to log the analytics event. The v0.8 analytics insert means every prompt
   writes anyway, so the readonly handle bought nothing — the hook now uses a
   single writable connection for both. Also starts collecting analytics from
@@ -76,7 +79,7 @@ robust under concurrency, and the package builds on current Node.
 
 - **`bufferToVec` no longer pins Node's shared 8 KB buffer pool.** A 1.5 KB
   embedding blob read via `Buffer.from` drew from Node's pooled allocator,
-  leaving each `Float32Array` as a *view* into the shared 8 KB chunk — pinning
+  leaving each `Float32Array` as a _view_ into the shared 8 KB chunk — pinning
   it alive and risking aliasing across vectors during rerank. Each vector now
   owns a tight, 4-byte-aligned 1.5 KB `ArrayBuffer`.
 - **Read paths no longer haul the embedding BLOB into JS.** Inject, `memory_search`
@@ -90,7 +93,7 @@ robust under concurrency, and the package builds on current Node.
   PreCompact, and SubagentStop used to `readFileSync` + `split` + `JSON.parse`
   every line into a retained `entries[]` array, then iterate it 2–3×. PreCompact
   fires precisely on the longest sessions — the worst moment to hold the file
-  string *and* a full array of parsed message objects. A shared single-pass
+  string _and_ a full array of parsed message objects. A shared single-pass
   reader (`src/utils/transcript.ts`) now extracts a bounded ring of recent
   prompts, a file Set, and the time span without retaining entries. Measured on
   a 25 MB / 40k-entry transcript: peak heap **+60 MB → +38 MB (≈36% lower)**.
@@ -145,7 +148,7 @@ language and query language.
   blend: `final = (1 - α) × fts_norm + α × cosine`. 0.4 keeps exact-keyword
   hits as the primary signal; raise to lean harder on semantic match.
 - New schema migration **v8**: `ALTER TABLE memories ADD COLUMN embedding
-  BLOB` plus a partial index on rows that have one. 1.5 KB/row × 200-cap =
+BLOB` plus a partial index on rows that have one. 1.5 KB/row × 200-cap =
   300 KB total — trivial.
 - 15 new tests (10 embeddings primitives via mock embedder, 1 db.v8
   migration, 4 hybrid/rebuild). Total: **89 tests**.

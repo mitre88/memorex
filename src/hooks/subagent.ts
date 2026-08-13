@@ -13,6 +13,7 @@
  */
 import { readFileSync } from 'fs';
 import { getDb } from '../db/index.js';
+import { insertSystemMemory } from '../db/evict.js';
 import { getProjectRoot } from '../utils/project.js';
 import { LIMITS, TIME } from '../utils/config.js';
 import { collectFirstUserLastAssistant } from '../utils/transcript.js';
@@ -92,12 +93,17 @@ function main(): void {
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = now + TTL_DAYS * TIME.DAY;
     const tags = JSON.stringify(['subagent', `agent-${agentName}`, `session-${sessionId}`]);
-    // Direct insert — bypasses session rate limit; this is a system-driven capture,
-    // not a user-initiated save. Matches the precompact hook's rationale.
-    db.prepare(
-      `INSERT INTO memories (type, title, body, project, tags, importance, pinned, created_at, accessed_at, expires_at)
-       VALUES ('feedback', ?, ?, ?, ?, 0.55, 0, ?, ?, ?)`
-    ).run(title, body, project, tags, now, now, expiresAt);
+    // Bypass the session rate limit (system-driven) but not the 200-memory cap.
+    insertSystemMemory(db, {
+      type: 'feedback',
+      title,
+      body,
+      project,
+      tags,
+      importance: 0.55,
+      now,
+      expiresAt,
+    });
   } catch {
     // Silent failure — sub-agent loop must proceed.
   } finally {

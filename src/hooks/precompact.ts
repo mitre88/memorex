@@ -20,6 +20,7 @@
  */
 import { readFileSync } from 'fs';
 import { getDb } from '../db/index.js';
+import { insertSystemMemory } from '../db/evict.js';
 import { getProjectRoot } from '../utils/project.js';
 import { TIME, LIMITS } from '../utils/config.js';
 import { collectSessionStats } from '../utils/transcript.js';
@@ -104,12 +105,17 @@ function main(): void {
     const expiresAt = now + TTL_DAYS * TIME.DAY;
     const title = `Pre-compact snapshot: ${ts}`;
     const tags = JSON.stringify(['compaction', `session-${sessionId}`]);
-    // Inserted directly — bypasses session rate limit because compaction is system-driven,
-    // not user-driven, and loss here is much worse than over-saving.
-    db.prepare(
-      `INSERT INTO memories (type, title, body, project, tags, importance, pinned, created_at, accessed_at, expires_at)
-       VALUES ('project', ?, ?, ?, ?, 0.6, 0, ?, ?, ?)`
-    ).run(title, body, project, tags, now, now, expiresAt);
+    // Bypass the session rate limit (system-driven) but not the 200-memory cap.
+    insertSystemMemory(db, {
+      type: 'project',
+      title,
+      body,
+      project,
+      tags,
+      importance: 0.6,
+      now,
+      expiresAt,
+    });
   } catch {
     // Silent failure — compaction must proceed.
   } finally {
